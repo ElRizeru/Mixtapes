@@ -2010,7 +2010,7 @@ class PlaylistPage(Adw.Bin):
                 from player.downloads import get_music_dir, _sanitize_filename
 
                 cover_path = os.path.join(
-                    get_music_dir(), "playlists", f"{_sanitize_filename(title)}.jpg"
+                    get_music_dir(), "Playlists", f"{_sanitize_filename(title)}.jpg"
                 )
                 if os.path.exists(cover_path):
                     self.cover_img.load_url(f"file://{cover_path}")

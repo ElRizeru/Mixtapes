@@ -2,7 +2,7 @@
 Download manager for offline playback.
 
 Downloads songs with full ID3 metadata and cover art, stores them in
-~/Music/YouTube Music/Artist/Album/NN - Title.ext
+~/Music/Mixtapes/Artist/Album/NN - Title.ext
 
 Never overwrites existing files. Tracks downloads in SQLite.
 Stores videoId and other YTM identifiers in metadata custom tags.
@@ -93,26 +93,45 @@ def set_folder_structure(structure):
     _save_prefs(prefs)
     return True
 
+def use_songs_subdir():
+    return _get_prefs().get("use_songs_subdir", False)
+
+
+def set_use_songs_subdir(enabled: bool):
+    prefs = _get_prefs()
+    prefs["use_songs_subdir"] = bool(enabled)
+    _save_prefs(prefs)
 
 def _build_download_dir(music_dir, artist_str, album, structure):
     """Build the destination directory based on the chosen folder structure.
 
-    Falls back gracefully when album metadata is missing: 'artist_album'
-    degrades to 'artist' rather than creating an 'Unknown' bucket."""
+    Songs are stored in ~/Music/Mixtapes/Songs/
+    Playlists remain in ~/Music/Mixtapes/Playlists/
+    """
+
+    if use_songs_subdir():
+        base_dir = os.path.join(music_dir, "Songs")
+    else:
+        base_dir = music_dir
+
     if structure == "flat":
-        return music_dir
+        return base_dir
+
     artist_dir = _sanitize_filename(artist_str.split(",")[0].strip())
+    artist_path = os.path.join(base_dir, artist_dir)
+
     if structure == "artist_album" and album:
-        return os.path.join(music_dir, artist_dir, _sanitize_filename(album))
-    return os.path.join(music_dir, artist_dir)
+        return os.path.join(artist_path, _sanitize_filename(album))
+
+    return artist_path
 
 
 def get_music_dir():
-    """Get the download directory: ~/Music/YouTube Music/"""
+    """Get the download directory: ~/Music/Mixtapes/"""
     music = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_MUSIC)
     if not music:
         music = os.path.expanduser("~/Music")
-    return os.path.join(music, "YouTube Music")
+    return os.path.join(music, "Mixtapes")
 
 
 _download_db_instance = None
@@ -1257,7 +1276,7 @@ class DownloadManager(GObject.Object):
             ordered_tracks = tracks or []
 
         music_dir = get_music_dir()
-        playlists_dir = os.path.join(music_dir, "playlists")
+        playlists_dir = os.path.join(music_dir, "Playlists")
         os.makedirs(playlists_dir, exist_ok=True)
         safe_name = _sanitize_filename(title)
         m3u_path = os.path.join(playlists_dir, f"{safe_name}.m3u8")
@@ -1355,7 +1374,7 @@ class DownloadManager(GObject.Object):
 
     def _prune_m3us_missing_files(self):
         """Remove entries from all m3u files whose target no longer exists."""
-        playlists_dir = os.path.join(get_music_dir(), "playlists")
+        playlists_dir = os.path.join(get_music_dir(), "Playlists")
         if not os.path.isdir(playlists_dir):
             return
         for name in os.listdir(playlists_dir):
@@ -1447,7 +1466,7 @@ class DownloadManager(GObject.Object):
 
     def _rewrite_m3us_with_map(self, path_map):
         """Update m3u relative paths to point at the new locations."""
-        playlists_dir = os.path.join(get_music_dir(), "playlists")
+        playlists_dir = os.path.join(get_music_dir(), "Playlists")
         if not os.path.isdir(playlists_dir):
             return
         for name in os.listdir(playlists_dir):

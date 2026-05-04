@@ -200,7 +200,7 @@ def save_playlist_cover_async(player, title, url):
     try:
         from player.downloads import get_music_dir, _sanitize_filename
 
-        cover_dir = os.path.join(get_music_dir(), "playlists")
+        cover_dir = os.path.join(get_music_dir(), "Playlists")
         os.makedirs(cover_dir, exist_ok=True)
         cover_path = os.path.join(cover_dir, f"{_sanitize_filename(title)}.jpg")
     except Exception:

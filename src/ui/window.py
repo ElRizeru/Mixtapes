@@ -1643,6 +1643,8 @@ class MainWindow(Adw.ApplicationWindow):
             FORMATS,
             FOLDER_STRUCTURES,
             get_music_dir,
+            use_songs_subdir,
+            set_use_songs_subdir,
         )
 
         format_row = Adw.ComboRow()
@@ -1716,6 +1718,38 @@ class MainWindow(Adw.ApplicationWindow):
 
         structure_row.connect("notify::selected", on_structure_changed)
         dl_group.add(structure_row)
+
+        songs_subdir_row = Adw.SwitchRow()
+        songs_subdir_row.set_title("Use Songs Subfolder")
+        songs_subdir_row.set_subtitle(
+            "Place downloads inside a Songs/ subfolder within the music directory"
+        )
+        songs_subdir_row.set_active(use_songs_subdir())
+
+        def on_songs_subdir_toggled(switch, pspec):
+            set_use_songs_subdir(switch.get_active())
+            dm = self.player.download_manager
+            if getattr(dm, "_downloading", False):
+                self.add_toast(
+                    "Subfolder setting saved. Existing files will be reorganized after downloads finish."
+                )
+                return
+            self.add_toast("Reorganizing downloads...")
+
+            def _run_migration():
+                moved, errors = dm.migrate_folder_structure()
+                if moved == 0 and errors == 0:
+                    msg = "Downloads already organized"
+                elif errors:
+                    msg = f"Reorganized {moved} file(s); {errors} skipped"
+                else:
+                    msg = f"Reorganized {moved} file(s)"
+                GLib.idle_add(self.add_toast, msg)
+
+            threading.Thread(target=_run_migration, daemon=True).start()
+
+        songs_subdir_row.connect("notify::active", on_songs_subdir_toggled)
+        dl_group.add(songs_subdir_row)
 
         prefs.present(self)
 
