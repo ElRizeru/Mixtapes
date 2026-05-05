@@ -116,7 +116,7 @@ class LoginDialog(Adw.Window):
     def _build_manual_view(self):
         page = Adw.StatusPage()
         page.set_title("Manual / Advanced")
-        page.set_description("Paste headers JSON or oauth.json content directly.")
+        page.set_description("Paste headers JSON content directly.")
 
         clamp = Adw.Clamp()
         clamp.set_maximum_size(600)
