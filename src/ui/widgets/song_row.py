@@ -318,10 +318,11 @@ class SongRowWidget(Gtk.Box):
         if self.model_item and self.page:
             # Trigger page activation logic
             if hasattr(self.page, "on_song_activated"):
-                # We need the position in the model.
-                # In Gtk.ListView, the widget doesn't know its' own position easily
-                # but we stored it in model_item.index when creating SongItem
-                self.page.on_song_activated(None, self.model_item.index)
+                # Pass the SongItem itself, not its stored .index — that index
+                # is the original position in the underlying store and goes
+                # stale once the user sorts or filters the view, which would
+                # send the wrong position to the player.
+                self.page.on_song_activated(None, self.model_item)
 
     def on_right_click(self, gesture, n_press, x, y):
         if not self.model_item:

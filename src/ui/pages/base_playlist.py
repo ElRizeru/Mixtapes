@@ -455,10 +455,25 @@ class BasePlaylistPage(Adw.Bin):
             if item.is_playing != is_playing:
                 item.is_playing = is_playing
 
-    def on_song_activated(self, list_view, position):
-        item = self.sort_model.get_item(position)
-        if not item:
-            return
+    def on_song_activated(self, list_view, position_or_item):
+        # Accepts either an int position (Gtk.ListView "activate" signal) or a
+        # SongItem (row-click gesture in SongRowWidget). A SongItem's stored
+        # .index reflects the underlying store, not the sorted/filtered view,
+        # so we resolve the live position by identity.
+        if isinstance(position_or_item, SongItem):
+            item = position_or_item
+            position = -1
+            for i in range(self.sort_model.get_n_items()):
+                if self.sort_model.get_item(i) is item:
+                    position = i
+                    break
+            if position == -1:
+                return
+        else:
+            position = position_or_item
+            item = self.sort_model.get_item(position)
+            if not item:
+                return
 
         # Get tracks in current order (sorted & filtered)
         tracks_to_queue = []
