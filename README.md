@@ -75,7 +75,7 @@ flatpak install --user mixtapes com.pocoguy.Muse
 
 > [!NOTE]
 > If you previously installed under the old "Muse" repository name, remove the old remote first:
-> `flatpak remote-delete --user mixtapes`
+> `flatpak remote-delete --user muse`
 
 <details>
 <summary>Offline bundle install</summary>
