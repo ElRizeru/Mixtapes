@@ -6,7 +6,7 @@ import os
 
 gi.require_version("Gst", "1.0")
 gi.require_version("GstAudio", "1.0")
-from gi.repository import Gst, GstAudio, GObject, GLib, GdkPixbuf, GLib
+from gi.repository import Gst, GstAudio, GObject, GLib, GdkPixbuf
 import glob
 from yt_dlp import YoutubeDL
 from ui.utils import get_high_res_url, get_ytimg_fallbacks
@@ -33,6 +33,34 @@ else:
 from player.discord_rpc import DiscordRPCAdapter
 
 
+def _parse_track_duration(track):
+    """Return a positive duration in seconds for `track`, or 0 if unknown.
+
+    ytmusicapi populates `duration_seconds` for most surfaces, but uploaded
+    songs from get_library_upload_songs() only carry `duration` as a "M:SS"
+    (or "H:MM:SS") string. Check both so the seek-bar fallback works for
+    uploads too.
+    """
+    secs = track.get("duration_seconds")
+    if isinstance(secs, (int, float)) and secs > 0:
+        return int(secs)
+    if isinstance(secs, str) and secs.isdigit():
+        n = int(secs)
+        if n > 0:
+            return n
+    dur = track.get("duration")
+    if isinstance(dur, str):
+        parts = dur.strip().split(":")
+        try:
+            if len(parts) == 2:
+                return int(parts[0]) * 60 + int(parts[1])
+            if len(parts) == 3:
+                return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+        except ValueError:
+            pass
+    return 0
+
+
 class Player(GObject.Object):
     __gsignals__ = {
         "state-changed": (
@@ -55,6 +83,16 @@ class Player(GObject.Object):
             None,
             (float, bool),
         ),  # volume, muted
+        "track-error": (
+            GObject.SignalFlags.RUN_FIRST,
+            None,
+            (str, str, str),
+        ),  # video_id, title, error_message
+        "visualizer-data": (
+            GObject.SignalFlags.RUN_FIRST,
+            None,
+            (object,),
+        ),  # list[float] magnitudes (dB, threshold .. 0)
     }
 
     def __init__(self):
@@ -68,6 +106,38 @@ class Player(GObject.Object):
         # GST_PLAY_FLAG_VIDEO is 1 << 0
         flags = self.player.get_property("flags")
         self.player.set_property("flags", flags & ~(1 << 0))
+
+        # Insert a passthrough spectrum analyzer between the decoder and the
+        # audio sink. The element emits ELEMENT bus messages with per-band
+        # magnitudes that the cover view's visualizer subscribes to. We pull
+        # plenty of raw bands (128) and let the UI reduce them to fewer
+        # display bars on a log scale, which gives a much more "alive" feel
+        # than a flat 32-band mapping (bass and treble each get their own
+        # display real estate instead of treble dominating).
+        self._visualizer_bands = 128
+        self._visualizer_threshold_db = -80.0
+        spectrum = Gst.ElementFactory.make("spectrum", "visualizer-spectrum")
+        if spectrum is not None:
+            spectrum.set_property("post-messages", True)
+            spectrum.set_property("message-magnitude", True)
+            spectrum.set_property("message-phase", False)
+            spectrum.set_property("interval", 33_000_000)  # 33 ms / ~30 Hz
+            spectrum.set_property("bands", self._visualizer_bands)
+            spectrum.set_property("threshold", int(self._visualizer_threshold_db))
+            spectrum.set_property("multi-channel", False)
+            self.player.set_property("audio-filter", spectrum)
+
+        # Inject auth cookies + User-Agent into the HTTP source on every
+        # source-setup. Helps for non-upload streams that need cookies on
+        # follow-up range requests; uploads still go via tmpfs (below).
+        self.player.connect("source-setup", self._on_source_setup)
+
+        # Tracks the current /dev/shm-backed local file for upload playback.
+        # Deleted when a new track loads or the app shuts down so we don't
+        # leak hundreds of MB into RAM across a long session.
+        self._current_tmpfs_path = None
+        import atexit
+        atexit.register(self._cleanup_all_tmpfs)
 
         self.ydl_opts = {
             "js_runtimes": {"node": {}},
@@ -202,24 +272,20 @@ class Player(GObject.Object):
             self.discord_rpc.update()
 
     def _on_mpris_state_changed(self, obj, state):
-        print(f"DEBUG-MPRIS-STATE-START: state={state}")
         if hasattr(self, "mpris_events"):
             # Explicitly tell the server the PlaybackStatus changed
             self.mpris_events.on_playpause()
             # Update metadata because length or 'CanGoNext' might have changed
             self.mpris_events.on_player_all()
-        print("DEBUG-MPRIS-STATE-END")
 
     def _on_mpris_metadata_changed(
         self, obj, title, artist, thumb, video_id, like_status
     ):
-        print(f"DEBUG-MPRIS-META-START: video_id={video_id}")
         if hasattr(self, "mpris_events"):
             # Trigger the 'Metadata' property update
             self.mpris_events.on_title()
             # Update UI-related flags like CanGoNext/Previous
             self.mpris_events.on_player_all()
-        print("DEBUG-MPRIS-META-END")
 
     def _on_mpris_progression(self, obj, pos, dur):
         # We don't usually emit D-Bus signals for every progression tick
@@ -291,6 +357,58 @@ class Player(GObject.Object):
                     print("[RADIO] No tracks returned")
             except Exception as e:
                 print(f"[RADIO] Error: {e}")
+
+        threading.Thread(target=_fetch, daemon=True).start()
+
+    def play_then_radio(self, tracks, start_index, seed_video_id):
+        """Play `tracks` starting at `start_index`, then continue with a radio
+        seeded from `seed_video_id` (typically the last track in the group).
+
+        Used by the home feed so that activating a song from a section plays
+        the rest of the section, then transitions into an infinite radio mix
+        when the section runs out.
+        """
+        if not tracks or not seed_video_id:
+            self.set_queue(tracks, start_index)
+            return
+
+        stamp = f"home-radio:{seed_video_id}:{id(tracks)}"
+        self.set_queue(tracks, start_index, source_id=stamp)
+
+        def _fetch():
+            try:
+                data = self.client.get_watch_playlist(
+                    video_id=seed_video_id, limit=50, radio=True
+                )
+                radio_tracks = data.get("tracks", [])
+                if not radio_tracks:
+                    return
+                self._normalize_watch_playlist_tracks(radio_tracks)
+                pid = data.get("playlistId")
+
+                def _apply():
+                    # If the user already replaced the queue, drop the result.
+                    if self.queue_source_id != stamp:
+                        return False
+                    existing = {
+                        t.get("videoId") for t in self.queue if t.get("videoId")
+                    }
+                    new = [
+                        t for t in radio_tracks
+                        if t.get("videoId") and t.get("videoId") not in existing
+                    ]
+                    if new:
+                        self.extend_queue(new)
+                    # Switch the source over to the real radio playlist so the
+                    # built-in infinite extender takes it from here.
+                    if pid:
+                        self.queue_source_id = pid
+                        self.queue_is_infinite = True
+                    return False
+
+                GObject.idle_add(_apply)
+            except Exception as e:
+                print(f"[HOME-RADIO] failed: {e}")
 
         threading.Thread(target=_fetch, daemon=True).start()
 
@@ -435,46 +553,127 @@ class Player(GObject.Object):
             self.stop()
             self.current_queue_index = index
             self._play_current_index()
-
-            # Check for infinite auto-append on manual skip
-            if self.queue_is_infinite and self.queue_source_id and self.client:
-                if (
-                    not self._is_fetching_infinite
-                    and self.current_queue_index >= len(self.queue) // 2
-                ):
-                    self._start_infinite_fetch()
-                else:
-                    print(
-                        f"\033[91m[DEBUG-INFINITE] Conditions NOT met (is_fetching={self._is_fetching_infinite}, index={self.current_queue_index}, halfway={len(self.queue) // 2})\033[0m"
-                    )
-
+            self._maybe_extend_infinite()
             self.emit("state-changed", "queue-updated")
 
     def next(self):
         if self.current_queue_index + 1 < len(self.queue):
             self.current_queue_index += 1
             self._play_current_index()
-
-            # Check for infinite auto-append
-            if self.queue_is_infinite and self.queue_source_id and self.client:
-                if (
-                    not self._is_fetching_infinite
-                    and self.current_queue_index >= len(self.queue) // 2
-                ):
-                    self._start_infinite_fetch()
-                else:
-                    print(
-                        f"\033[91m[DEBUG-INFINITE] Conditions NOT met (is_fetching={self._is_fetching_infinite}, index={self.current_queue_index}, halfway={len(self.queue) // 2})\033[0m"
-                    )
+            self._maybe_extend_infinite()
         else:
             if self.repeat_mode == "all" and self.queue:
                 self.current_queue_index = 0
                 self._play_current_index()
+            elif (
+                self.queue_is_infinite
+                and self.queue_source_id
+                and self.client
+                and self.queue
+            ):
+                # Queue actually ran out on an infinite source. The standard
+                # halfway-trigger should normally hide this, but YT sometimes
+                # returns the same radio batch for the same seed videoId and
+                # our dedup filter ends up wiping the whole response. Kick
+                # off a final extension keyed on the currently-playing track
+                # before declaring the queue dead.
+                self._force_radio_extend()
             else:
                 self.stop()  # End of queue
                 self.current_queue_index = -1
 
         self.emit("state-changed", "queue-updated")
+
+    def _maybe_extend_infinite(self):
+        """Trigger background fetch of more radio tracks when the queue is
+        running low. Called from manual skip, next(), and seek paths.
+
+        We fire earlier than the old "halfway" trigger — extending at
+        halfway leaves no headroom if the fetch is slow OR if dedup kills
+        the response. Firing when fewer than 15 tracks remain (or we're
+        past halfway, whichever comes first) gives us multiple shots."""
+        if not (self.queue_is_infinite and self.queue_source_id and self.client):
+            return
+        if self._is_fetching_infinite:
+            return
+        if self.current_queue_index < 0 or not self.queue:
+            return
+
+        remaining = len(self.queue) - 1 - self.current_queue_index
+        past_halfway = self.current_queue_index >= len(self.queue) // 2
+        if remaining <= 15 or past_halfway:
+            self._start_infinite_fetch()
+
+    def _force_radio_extend(self):
+        """Last-ditch radio extension when the queue is empty and the
+        normal infinite fetch hasn't bought us new tracks. Seeds the
+        watch_playlist from the currently/last-played track instead of the
+        queue's tail (which has typically already produced a deduped
+        response for radios with a fixed first batch). If even this
+        comes back with nothing new, we accept the response as-is rather
+        than silently stopping playback."""
+        if self._is_fetching_infinite:
+            return
+        self._is_fetching_infinite = True
+
+        seed_vid = self.current_video_id
+        if not seed_vid and self.queue:
+            seed_vid = self.queue[-1].get("videoId")
+        if not seed_vid:
+            self._is_fetching_infinite = False
+            self.stop()
+            self.current_queue_index = -1
+            return
+
+        def fetch():
+            try:
+                data = self.client.get_watch_playlist(
+                    video_id=seed_vid, limit=50, radio=True
+                )
+                tracks = data.get("tracks", []) or []
+                self._normalize_watch_playlist_tracks(tracks)
+                existing = {t.get("videoId") for t in self.queue if t.get("videoId")}
+                new_tracks = [
+                    t for t in tracks
+                    if t.get("videoId") and t.get("videoId") not in existing
+                ]
+                # If every result was a dupe, fall back to appending the
+                # response anyway (skipping just the seed itself). Replaying
+                # a few songs is a better outcome than silent stop.
+                if not new_tracks and tracks:
+                    new_tracks = [
+                        t for t in tracks
+                        if t.get("videoId") and t.get("videoId") != seed_vid
+                    ]
+
+                def _apply():
+                    self._is_fetching_infinite = False
+                    if not new_tracks:
+                        self.stop()
+                        self.current_queue_index = -1
+                        self.emit("state-changed", "queue-updated")
+                        return False
+                    start_idx = len(self.queue)
+                    self.extend_queue(new_tracks)
+                    self.current_queue_index = start_idx
+                    self._play_current_index()
+                    self.emit("state-changed", "queue-updated")
+                    return False
+
+                GObject.idle_add(_apply)
+            except Exception as e:
+                print(f"[RADIO-EXTEND-FORCED] failed: {e}")
+
+                def _give_up():
+                    self._is_fetching_infinite = False
+                    self.stop()
+                    self.current_queue_index = -1
+                    self.emit("state-changed", "queue-updated")
+                    return False
+
+                GObject.idle_add(_give_up)
+
+        threading.Thread(target=fetch, daemon=True).start()
 
     def previous(self):
         # If > 5 seconds in, restart song
@@ -558,13 +757,6 @@ class Player(GObject.Object):
             thumb = track.get("thumb")
             like_status = str(track.get("likeStatus") or "INDIFFERENT")
 
-            import traceback as _tb
-            caller_stack = "".join(_tb.format_stack(limit=6)[:-1])
-            print(
-                f"DEBUG-PLAY: index={self.current_queue_index} video_id={video_id} queue_len={len(self.queue)}\nCALLER:\n{caller_stack}",
-                flush=True,
-            )
-
             # Metadata Normalization & Persistence
             # Handle raw ytmusicapi data and ensure persistent strings in the queue
             if not artist and track.get("artists"):
@@ -603,6 +795,13 @@ class Player(GObject.Object):
             self.player.set_state(Gst.State.NULL)
         except Exception as e:
             print(f"set_state ERROR: {e}")
+
+        # Drop the previous track's tmpfs buffer (if any) — by this point
+        # the pipeline has released the file. We do this before setting the
+        # new video_id so a fast track-change can't leave the buffer behind.
+        if self._current_tmpfs_path:
+            self._cleanup_tmpfs_path(self._current_tmpfs_path)
+            self._current_tmpfs_path = None
 
         self.current_video_id = video_id
         self.duration = -1
@@ -670,11 +869,35 @@ class Player(GObject.Object):
         # and a fresh extraction usually picks a healthier host.
         self._stream_retry_count = 0
         self._stream_retry_max = 2
-        cached_url = self.stream_cache.get(video_id)
-        if cached_url:
-            print(f"[CACHE] Using cached stream URL for {video_id}")
-            self._used_cached_url = True
-            GLib.idle_add(self._start_playback, cached_url)
+
+        # Upload tracks (entityId set by ytmusicapi's library-upload surfaces)
+        # always go through the tmpfs path in _fetch_and_play. Using the
+        # cached stream URL here would start streaming first, then the tmpfs
+        # download would restart playback when it finished — visible to the
+        # user as "the song jumped back to 0 when I tried to seek".
+        cur_track = (
+            self.queue[self.current_queue_index]
+            if 0 <= self.current_queue_index < len(self.queue)
+            else {}
+        )
+        is_upload = bool(cur_track.get("entityId"))
+        # If the queued track is a music video (OMV/UGC), `_fetch_and_play`
+        # will swap to the audio (ATV) version before yt-dlp resolves —
+        # skip the early cache check here because it would key on the
+        # OMV videoId and start playing the video stream before the swap
+        # can happen.
+        vtype_upper = (cur_track.get("videoType") or "").upper()
+        will_swap = (
+            vtype_upper.startswith("MUSIC_VIDEO_TYPE_")
+            and vtype_upper != "MUSIC_VIDEO_TYPE_ATV"
+        )
+
+        if not is_upload and not will_swap:
+            cached_url = self.stream_cache.get(video_id)
+            if cached_url:
+                print(f"[CACHE] Using cached stream URL for {video_id}")
+                self._used_cached_url = True
+                GLib.idle_add(self._start_playback, cached_url)
 
         thread = threading.Thread(
             target=self._fetch_and_play,
@@ -777,23 +1000,54 @@ class Player(GObject.Object):
         last_video_id = None
         if self.queue:
             last_video_id = self.queue[-1].get("videoId")
+        playlist_id = self.queue_source_id
+        # Sources stamped by play_then_radio aren't real playlist IDs (they
+        # use a "home-radio:…" prefix as a queue-identity stamp). Don't pass
+        # them as playlist_id — that confuses watch_playlist. The video seed
+        # is enough to get a fresh radio.
+        if playlist_id and ":" in playlist_id:
+            playlist_id = None
 
         def fetch_job():
             try:
                 data = self.client.get_watch_playlist(
                     video_id=last_video_id,
-                    playlist_id=self.queue_source_id,
+                    playlist_id=playlist_id,
                     limit=limit,
                     radio=True,
                 )
-                tracks = data.get("tracks", [])
+                tracks = data.get("tracks", []) or []
                 self._normalize_watch_playlist_tracks(tracks)
-
-                # Filter out tracks already in our queue
                 existing_ids = {
                     t.get("videoId") for t in self.queue if t.get("videoId")
                 }
-                new_tracks = [t for t in tracks if t.get("videoId") not in existing_ids]
+                new_tracks = [
+                    t for t in tracks
+                    if t.get("videoId") and t.get("videoId") not in existing_ids
+                ]
+
+                # Dedup-rescue: radios with a deterministic first batch will
+                # return the same tracks for the same seed, so the first
+                # `existing_ids` filter wipes the entire response. Retry
+                # once with the currently-playing track as the seed (which
+                # is typically a different position in the radio than the
+                # queue's tail).
+                if (
+                    not new_tracks
+                    and self.current_video_id
+                    and self.current_video_id != last_video_id
+                ):
+                    retry = self.client.get_watch_playlist(
+                        video_id=self.current_video_id,
+                        limit=limit,
+                        radio=True,
+                    )
+                    retry_tracks = retry.get("tracks", []) or []
+                    self._normalize_watch_playlist_tracks(retry_tracks)
+                    new_tracks = [
+                        t for t in retry_tracks
+                        if t.get("videoId") and t.get("videoId") not in existing_ids
+                    ]
 
                 if new_tracks:
                     GObject.idle_add(self._on_infinite_fetch_complete, new_tracks)
@@ -841,6 +1095,115 @@ class Player(GObject.Object):
 
         return path
 
+    def _tmpfs_root(self):
+        """Pick a RAM-backed directory for upload buffers. /dev/shm is a
+        tmpfs on every modern Linux distro; /tmp is sometimes tmpfs and
+        sometimes not. Falls back to the platform tempdir if neither
+        works."""
+        import tempfile
+        for candidate in ("/dev/shm", "/run/user/{}".format(os.getuid())):
+            if os.path.isdir(candidate) and os.access(candidate, os.W_OK):
+                return candidate
+        return tempfile.gettempdir()
+
+    def _download_upload_to_tmpfs(self, video_id, generation):
+        """Pull an upload track into a tmpfs file via yt-dlp. Returns the
+        local file path on success, None otherwise. Blocks the calling
+        worker thread until the download is complete — typical upload is
+        a few MB so this finishes in <2s on a normal connection. The
+        caller is responsible for tracking the path so we can delete it
+        on track change.
+
+        Bails early if the user skipped to a different track mid-download
+        (load_generation changes invalidate the result)."""
+        import tempfile
+
+        tmp_dir = tempfile.mkdtemp(prefix="muse-stream-", dir=self._tmpfs_root())
+        outtmpl = os.path.join(tmp_dir, f"{video_id}.%(ext)s")
+
+        opts = self.ydl_opts.copy()
+        opts["outtmpl"] = outtmpl
+        opts["quiet"] = True
+        opts["noprogress"] = True
+        # Don't write thumbnails / json / etc into the tmpfs dir.
+        opts["writethumbnail"] = False
+        opts["writeinfojson"] = False
+
+        cookie_file = None
+        try:
+            if self.client.is_authenticated() and self.client.api:
+                cookie_file = self._create_cookie_file(self.client.api.headers)
+                if cookie_file:
+                    opts["cookiefile"] = cookie_file
+                ua = self.client.api.headers.get("User-Agent")
+                if ua:
+                    opts["user_agent"] = ua
+                    opts["http_headers"] = {"User-Agent": ua}
+
+            url = f"https://music.youtube.com/watch?v={video_id}"
+            with YoutubeDL(opts) as ydl:
+                ydl.download([url])
+
+            if generation != self.load_generation:
+                # User skipped during the download — discard the half-baked
+                # file rather than handing it back for playback.
+                self._rm_tmpfs_dir(tmp_dir)
+                return None
+
+            for name in os.listdir(tmp_dir):
+                if name.startswith(video_id + "."):
+                    return os.path.join(tmp_dir, name)
+            self._rm_tmpfs_dir(tmp_dir)
+            return None
+        except Exception as e:
+            print(f"[PLAYER] tmpfs download error for {video_id}: {e}")
+            self._rm_tmpfs_dir(tmp_dir)
+            return None
+        finally:
+            if cookie_file and os.path.exists(cookie_file):
+                try:
+                    os.remove(cookie_file)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _rm_tmpfs_dir(path):
+        if not path:
+            return
+        try:
+            import shutil
+            shutil.rmtree(path, ignore_errors=True)
+        except Exception:
+            pass
+
+    def _cleanup_tmpfs_path(self, path):
+        """Remove a single tmpfs file + its parent dir (we use a fresh
+        mkdtemp per track so the dir contains only the one file)."""
+        if not path:
+            return
+        try:
+            parent = os.path.dirname(path)
+            if parent and "muse-stream-" in parent:
+                self._rm_tmpfs_dir(parent)
+            elif os.path.exists(path):
+                os.remove(path)
+        except OSError as e:
+            print(f"[PLAYER] tmpfs cleanup failed for {path}: {e}")
+
+    def _cleanup_all_tmpfs(self):
+        """atexit hook — sweep our prefix dirs in the tmpfs root in case a
+        prior crash left orphans, plus our currently tracked path."""
+        if self._current_tmpfs_path:
+            self._cleanup_tmpfs_path(self._current_tmpfs_path)
+            self._current_tmpfs_path = None
+        try:
+            root = self._tmpfs_root()
+            for name in os.listdir(root):
+                if name.startswith("muse-stream-"):
+                    self._rm_tmpfs_dir(os.path.join(root, name))
+        except OSError:
+            pass
+
     def _fetch_and_play(
         self,
         video_id,
@@ -857,12 +1220,92 @@ class Player(GObject.Object):
             return
         import os
 
+        # If the queued track is YT Music's music-video version of a song,
+        # swap to the audio (ATV) version BEFORE yt-dlp resolves so we
+        # stream the cleaner album audio and get clean metadata. We do
+        # this in the worker thread (not in _load_internal) because the
+        # lookup is a network round-trip and shouldn't block the UI.
+        # find_audio_version() short-circuits cheaply when the source is
+        # already ATV (returns None), so we can call it unconditionally
+        # — needed because YT Music's album/single endpoint doesn't
+        # always populate `videoType`, and gating on it here meant the
+        # swap never fired for those cases. Caching the result on the
+        # track ensures we only pay the API cost on first play.
+        track = (
+            self.queue[self.current_queue_index]
+            if 0 <= self.current_queue_index < len(self.queue)
+            else {}
+        )
+        already_checked = track.get("_swap_checked")
+        if (
+            not already_checked
+            and track.get("videoId") == video_id
+            and not track.get("entityId")  # uploads have no counterpart
+        ):
+            try:
+                swapped = self.client.find_audio_version(video_id)
+            except Exception as e:
+                print(f"[swap-version] lookup failed: {e}")
+                swapped = None
+            if generation != self.load_generation:
+                return
+            track["_swap_checked"] = True
+            if swapped and swapped != video_id:
+                print(
+                    f"[swap-version] {video_id} → {swapped} ({track.get('title')})"
+                )
+                track["videoId"] = swapped
+                track["videoType"] = "MUSIC_VIDEO_TYPE_ATV"
+                video_id = swapped
+                self.current_video_id = swapped
+                GObject.idle_add(
+                    self.emit,
+                    "metadata-changed",
+                    str(title_hint),
+                    str(artist_hint),
+                    str(thumb_hint or ""),
+                    str(swapped),
+                    str(like_status_hint),
+                )
+
+        # Upload-locker tracks: YT's range-request handling on those URLs
+        # silently breaks seeking even with cookies attached. Sidestep the
+        # whole streaming pipeline by downloading the file into tmpfs
+        # (/dev/shm — RAM-backed on Linux) and playing from there. The
+        # local file is deleted as soon as the user moves to a new track,
+        # so nothing accumulates on disk.
+        if track.get("entityId"):
+            tmpfs_path = self._download_upload_to_tmpfs(video_id, generation)
+            if generation != self.load_generation:
+                # User skipped while we were downloading — _download cleans
+                # up its own tmp dir on cancel via the generation check.
+                return
+            if tmpfs_path:
+                self._current_tmpfs_path = tmpfs_path
+                file_uri = GLib.filename_to_uri(os.path.abspath(tmpfs_path), None)
+                self._used_cached_url = False
+                final_title = title_hint or track.get("title") or "Unknown"
+                final_artist = artist_hint or track.get("artist") or "Unknown"
+                final_thumb = thumb_hint or track.get("thumb") or ""
+                GObject.idle_add(
+                    self.emit,
+                    "metadata-changed",
+                    final_title,
+                    final_artist,
+                    final_thumb,
+                    video_id,
+                    like_status_hint,
+                )
+                GLib.idle_add(self._start_playback, file_uri)
+                return
+            # tmpfs download failed — fall through to the normal streaming
+            # path. Seek won't work, but at least playback won't be blocked.
+            print(f"[PLAYER] tmpfs download failed for upload {video_id}, falling back to streaming")
+
         url = f"https://music.youtube.com/watch?v={video_id}"
 
         # Use a local copy of options to prevent race conditions
         opts = self.ydl_opts.copy()
-        # Enable verbose for one cycle to debug cookie usage
-        opts["verbose"] = True
 
         cookie_file = None
         try:
@@ -1000,13 +1443,50 @@ class Player(GObject.Object):
                 # Pre-cache next songs in queue
                 self._precache_next(generation)
         except Exception as e:
-            print(f"Error fetching URL: {e}")
+            # yt-dlp throws DownloadError / ExtractorError when a video is
+            # unavailable, region-locked, removed, etc. The previous code
+            # silently swallowed this — the player just sat in "loading"
+            # forever. Skip to the next track and surface the error to the
+            # UI via the new track-error signal.
+            print(f"Error fetching URL for {video_id}: {e}")
+            if generation == self.load_generation:
+                msg = self._summarize_yt_dlp_error(e)
+                failed_title = title_hint or "Track"
+                GObject.idle_add(
+                    self.emit, "track-error", video_id, failed_title, msg
+                )
+                # Auto-advance if there's something to advance to. If we're
+                # already at the end of the queue, just stop instead of
+                # looping back.
+                if self.current_queue_index + 1 < len(self.queue):
+                    GObject.idle_add(self.next)
+                else:
+                    GObject.idle_add(self.stop)
         finally:
             if cookie_file and os.path.exists(cookie_file):
                 try:
                     os.remove(cookie_file)
                 except:
                     pass
+
+    def _summarize_yt_dlp_error(self, exc):
+        """Pull a short, user-readable reason out of a yt-dlp exception.
+        yt-dlp's str(exc) is usually a long path + verbose traceback line;
+        we only want the bit a human would put in a toast."""
+        msg = str(exc) if exc else ""
+        # Prefer the first 'ERROR: ...' chunk if yt-dlp emitted one.
+        if "ERROR:" in msg:
+            msg = msg.split("ERROR:", 1)[1].strip()
+        # Strip the ': <verbose>' tail past the first sentence so the toast
+        # doesn't wrap forever.
+        for sep in (". ", "; "):
+            if sep in msg:
+                msg = msg.split(sep, 1)[0]
+                break
+        msg = msg.strip(" .")
+        if not msg:
+            msg = "Could not load this track"
+        return msg[:140]
 
     def _precache_next(self, generation):
         """Pre-cache stream URLs for 3 songs ahead and 3 behind."""
@@ -1030,6 +1510,11 @@ class Player(GObject.Object):
             track = self.queue[idx]
             vid = track.get("videoId")
             if not vid or self.stream_cache.get(vid):
+                continue
+            # Skip upload tracks — their stream URL would be unusable anyway
+            # (we always play them from a tmpfs buffer). Avoids wasted yt-dlp
+            # extractions in the background.
+            if track.get("entityId"):
                 continue
             try:
                 url = f"https://music.youtube.com/watch?v={vid}"
@@ -1060,6 +1545,49 @@ class Player(GObject.Object):
                         os.remove(cookie_file)
                     except OSError:
                         pass
+
+    def _on_source_setup(self, playbin, source):
+        """Configure the HTTP source element playbin just created. We push
+        the signed-in client's Cookie + User-Agent onto every request so
+        YT's upload-locker URL honors byte-range requests (i.e. seeking)
+        the same way the web player does."""
+        if not source:
+            return
+        # Only relevant for HTTP-based sources (souphttpsrc, curlhttpsrc).
+        # file:// playback gets a filesrc which doesn't have these props.
+        try:
+            name = source.get_factory().get_name()
+        except Exception:
+            name = ""
+        if name not in ("souphttpsrc", "curlhttpsrc"):
+            return
+
+        try:
+            if self.client and self.client.is_authenticated() and self.client.api:
+                headers = self.client.api.headers or {}
+                ua = headers.get("User-Agent")
+                cookie = headers.get("Cookie")
+                if ua:
+                    try:
+                        source.set_property("user-agent", ua)
+                    except Exception:
+                        pass
+
+                # extra-headers is a Gst.Structure of arbitrary HTTP
+                # headers — this is what gets sent on EVERY request the
+                # source makes (initial GET + each Range follow-up).
+                if cookie:
+                    extra = Gst.Structure.new_empty("extra-headers")
+                    extra.set_value("Cookie", cookie)
+                    auth = headers.get("Authorization")
+                    if auth:
+                        extra.set_value("Authorization", auth)
+                    try:
+                        source.set_property("extra-headers", extra)
+                    except Exception as e:
+                        print(f"[PLAYER] set extra-headers failed: {e}")
+        except Exception as e:
+            print(f"[PLAYER] source-setup hook error: {e}")
 
     def _start_playback(self, uri, cookie_file=None):
         self.player.set_state(Gst.State.NULL)
@@ -1101,6 +1629,60 @@ class Player(GObject.Object):
             except Exception as e:
                 pass
 
+    def _dispatch_spectrum_message(self, structure):
+        """Pull the per-band magnitude list out of a spectrum element bus
+        message and re-emit it as a `visualizer-data` signal.
+
+        GStreamer's `spectrum` reports `magnitude` as a GstValueList in
+        modern (≥1.20) builds and as a GValueArray on older systems.
+        PyGObject surfaces these very differently — sometimes as a plain
+        Python list, sometimes as an object with `.n_values` / `.get_nth`,
+        and sometimes via `Gst.Structure.get_list` returning (ok, list).
+        We try all three.
+        """
+        bands = None
+
+        # Path 1: get_list returns (bool, [floats]) for GstValueList fields.
+        try:
+            ok, mags = structure.get_list("magnitude")
+            if ok and mags is not None:
+                bands = [float(v) for v in mags]
+        except Exception:
+            pass
+
+        # Path 2: get_value returns either a list or a GValueArray-like.
+        if not bands:
+            try:
+                raw = structure.get_value("magnitude")
+            except Exception:
+                raw = None
+            if raw is not None:
+                if isinstance(raw, (list, tuple)):
+                    try:
+                        bands = [float(v) for v in raw]
+                    except Exception:
+                        pass
+                elif hasattr(raw, "n_values"):
+                    try:
+                        bands = []
+                        for i in range(raw.n_values):
+                            v = raw.get_nth(i)
+                            bands.append(
+                                float(v.get_float()) if hasattr(v, "get_float") else float(v)
+                            )
+                    except Exception:
+                        bands = None
+                else:
+                    # Last-ditch: it iterates.
+                    try:
+                        bands = [float(v) for v in raw]
+                    except Exception:
+                        bands = None
+
+        if not bands:
+            return
+        self.emit("visualizer-data", bands)
+
     def on_message(self, bus, message):
         t = message.type
         if t == Gst.MessageType.EOS:
@@ -1134,6 +1716,11 @@ class Player(GObject.Object):
             # The stream is actually loaded and ready
             if hasattr(self, "mpris_events"):
                 self.mpris_events.on_player_all()  # Refresh duration and status
+        elif t == Gst.MessageType.ELEMENT:
+            # Spectrum analyzer posts magnitude data here on every interval.
+            structure = message.get_structure()
+            if structure is not None and structure.get_name() == "spectrum":
+                self._dispatch_spectrum_message(structure)
         elif t == Gst.MessageType.ERROR:
             err, debug = message.parse_error()
             print(f"Error: {err}, {debug}")
@@ -1331,6 +1918,18 @@ class Player(GObject.Object):
                     if hasattr(self, "mpris_events"):
                         GLib.idle_add(self.mpris_events.on_player_all)
 
+                    # 5. Propagate the working URL back to the track so
+                    # Discord RPC (which sends the URL string to Discord
+                    # for it to fetch) and any other consumer of
+                    # track["thumb"] stop showing the dead maxresdefault.
+                    # update_track_thumbnail is a no-op when the URL
+                    # already matches, so this is safe to call
+                    # unconditionally.
+                    if fetch_url and fetch_url != url:
+                        GLib.idle_add(
+                            self.update_track_thumbnail, video_id, fetch_url
+                        )
+
             except Exception as e:
                 if fallbacks:
                     next_url = fallbacks.pop(0)
@@ -1354,18 +1953,37 @@ class Player(GObject.Object):
 
         ret, state, pending = self.player.get_state(0)
         if state in [Gst.State.PLAYING, Gst.State.PAUSED]:
-            # 2. Update Duration if it changed (vital for MPRIS progress bar scale)
+            # 2. Update Duration if it changed (vital for MPRIS progress bar scale).
+            # Only trust a POSITIVE duration from GStreamer — some upload-song
+            # streams return success=True with dur_nanos=0 on the first ticks
+            # (and sometimes throughout, when YT's locker endpoint doesn't
+            # advertise a length). Treat those as unknown and fall through to
+            # the metadata fallback.
+            new_dur = None
             success_dur, dur_nanos = self.player.query_duration(Gst.Format.TIME)
-            if success_dur:
+            if success_dur and dur_nanos > 0:
                 new_dur = dur_nanos / Gst.SECOND
-                if (
-                    abs(new_dur - self.duration) > 0.1
-                ):  # Threshold to avoid float jitter
+
+            if new_dur is not None:
+                if abs(new_dur - self.duration) > 0.1:
                     self.duration = new_dur
                     if hasattr(self, "mpris_events"):
                         self.mpris_events.on_title()  # Syncs 'mpris:length'
                     if getattr(self, "discord_rpc", None):
                         self.discord_rpc.update()
+            elif self.duration <= 0:
+                # GStreamer doesn't know the length yet — use the track's
+                # metadata so the seek bar has a range to drag inside.
+                # Uploaded songs from get_library_upload_songs() only
+                # carry `duration` as "M:SS" string (no `duration_seconds`),
+                # so check both.
+                if 0 <= self.current_queue_index < len(self.queue):
+                    track = self.queue[self.current_queue_index]
+                    meta_dur = _parse_track_duration(track)
+                    if meta_dur > 0:
+                        self.duration = float(meta_dur)
+                        if hasattr(self, "mpris_events"):
+                            self.mpris_events.on_title()
 
             # 3. Update Position
             success_pos, pos_nanos = self.player.query_position(Gst.Format.TIME)
@@ -1429,26 +2047,56 @@ class Player(GObject.Object):
         self._history_mode = mode
 
     def seek(self, position, flush=True):
-        """Seek to position in seconds"""
+        """Seek to position in seconds. Returns True on success, False on
+        failure (e.g. the stream doesn't support range requests — common
+        for YT Music upload-locker URLs)."""
         if self.player.get_state(0)[1] == Gst.State.NULL:
-            return
+            return False
 
         import time
 
         self.last_seek_time = time.time()
 
+        # Check whether the pipeline reports as seekable BEFORE attempting.
+        # This is cheap, and lets us avoid trying a seek that we know will
+        # silently fail — letting on_scale_change_value know not to bother.
+        seekable = False
+        try:
+            q = Gst.Query.new_seeking(Gst.Format.TIME)
+            if self.player.query(q):
+                _, seekable, _, _ = q.parse_seeking()
+        except Exception:
+            seekable = True  # be permissive — try anyway
+
         flags = Gst.SeekFlags.ACCURATE
         if flush:
             flags |= Gst.SeekFlags.FLUSH
 
-        self.player.seek_simple(
+        ok = self.player.seek_simple(
             Gst.Format.TIME,
             flags,
             int(position * Gst.SECOND),
         )
 
+        # ACCURATE seeks sometimes get rejected by sources that would accept
+        # a keyframe-aligned seek. Fall back to KEY_UNIT so we still move.
+        if not ok:
+            ok = self.player.seek_simple(
+                Gst.Format.TIME,
+                (Gst.SeekFlags.KEY_UNIT | Gst.SeekFlags.FLUSH) if flush else Gst.SeekFlags.KEY_UNIT,
+                int(position * Gst.SECOND),
+            )
+
+        if not ok:
+            print(
+                f"[PLAYER] seek to {position:.1f}s rejected by pipeline "
+                f"(seekable={seekable}, vid={self.current_video_id})"
+            )
+            return False
+
         if hasattr(self, "mpris_events"):
             self.mpris_events.on_seek(int(position * 1_000_000))
+        return True
 
     def get_volume(self):
         """Get volume in cubic (perceptual) scale 0.0-1.0, matching system mixer."""

@@ -258,7 +258,17 @@ class DownloadDB:
         os.makedirs(db_dir, exist_ok=True)
         self._db_path = os.path.join(db_dir, "library.db")
         self._lock = threading.Lock()
+        # In-memory {video_id: file_path} of downloaded tracks. is_downloaded()
+        # is on the song-row bind path, so hitting SQLite per row was stalling
+        # the UI when opening large playlists. The cached path lets us still
+        # detect out-of-band file deletions with a single stat() per call,
+        # which is far cheaper than the locked SQLite query it replaces.
+        # Kept in sync by add_download() and remove_download() — every DB
+        # mutation flows through this class.
+        self._id_cache = {}
+        self._id_cache_lock = threading.Lock()
         self._init_db()
+        self._load_id_cache()
 
     def _connect(self):
         """Create a DB connection, ensuring the parent directory exists."""
@@ -304,18 +314,53 @@ class DownloadDB:
             conn.commit()
             conn.close()
 
+    def _load_id_cache(self):
+        try:
+            with self._lock:
+                conn = self._connect()
+                rows = conn.execute(
+                    "SELECT video_id, file_path FROM downloads WHERE file_path IS NOT NULL"
+                ).fetchall()
+                conn.close()
+        except sqlite3.Error as e:
+            print(f"[DOWNLOAD] Failed to seed id cache: {e}")
+            return
+        with self._id_cache_lock:
+            self._id_cache = {vid: path for vid, path in rows if vid and path}
+
     def is_downloaded(self, video_id):
         if not video_id:
             return False
-        with self._lock:
-            conn = self._connect()
-            row = conn.execute(
-                "SELECT file_path FROM downloads WHERE video_id = ?", (video_id,)
-            ).fetchone()
-            conn.close()
-            if row and row[0]:
-                return os.path.exists(row[0])
+        with self._id_cache_lock:
+            path = self._id_cache.get(video_id)
+        if not path:
             return False
+        # Stat the file so out-of-band deletions (file manager, `rm`) are
+        # reflected without a DB roundtrip. If the file is gone, evict from
+        # the cache and DB so the dl-icon flips off and stays off.
+        if os.path.exists(path):
+            return True
+        self._evict_missing(video_id)
+        return False
+
+    def _evict_missing(self, video_id):
+        with self._id_cache_lock:
+            self._id_cache.pop(video_id, None)
+        try:
+            with self._lock:
+                conn = self._connect()
+                conn.execute(
+                    "DELETE FROM downloads WHERE video_id = ?", (video_id,)
+                )
+                conn.commit()
+                conn.close()
+        except sqlite3.Error as e:
+            print(f"[DOWNLOAD] Failed to evict missing {video_id}: {e}")
+        try:
+            from ui.utils import invalidate_local_cover
+            invalidate_local_cover(video_id)
+        except Exception:
+            pass
 
     def get_local_path(self, video_id):
         if not video_id:
@@ -346,6 +391,16 @@ class DownloadDB:
                   time.strftime("%Y-%m-%dT%H:%M:%S"), file_size, fmt))
             conn.commit()
             conn.close()
+        if video_id and file_path:
+            with self._id_cache_lock:
+                self._id_cache[video_id] = file_path
+            # Drop any cached "this track isn't downloaded" answer so the row
+            # picks up the fresh embedded cover on next bind.
+            try:
+                from ui.utils import invalidate_local_cover
+                invalidate_local_cover(video_id)
+            except Exception:
+                pass
 
     def get_all_downloads(self):
         with self._lock:
@@ -361,6 +416,14 @@ class DownloadDB:
             conn.execute("DELETE FROM downloads WHERE video_id = ?", (video_id,))
             conn.commit()
             conn.close()
+        if video_id:
+            with self._id_cache_lock:
+                self._id_cache.pop(video_id, None)
+            try:
+                from ui.utils import invalidate_local_cover
+                invalidate_local_cover(video_id)
+            except Exception:
+                pass
 
     def update_file_path(self, video_id, new_path):
         with self._lock:
@@ -371,6 +434,10 @@ class DownloadDB:
             )
             conn.commit()
             conn.close()
+        if video_id and new_path:
+            with self._id_cache_lock:
+                if video_id in self._id_cache:
+                    self._id_cache[video_id] = new_path
 
     def get_video_for_path(self, file_path):
         """Return the video_id of whichever row owns `file_path`, or None."""
@@ -437,10 +504,20 @@ class DownloadDB:
                 existing_count = 0
 
             new_count = len(tracks) if tracks else 0
-            if existing_count > new_count:
+            # The guard exists so a partial fetch (limit=200) can't clobber
+            # a full previously-cached set. But when track_count tells us
+            # the new fetch IS the full playlist (e.g. the user just
+            # deleted tracks on the YT web app and the live fetch returns
+            # a smaller-but-complete list), we should accept it — otherwise
+            # the user has to manually refresh to see external edits.
+            is_full_fetch = (
+                track_count is not None and new_count >= int(track_count)
+            )
+            if existing_count > new_count and not is_full_fetch:
                 print(
                     f"[DB] cache_playlist: skipping regression "
-                    f"({new_count} < existing {existing_count}) for {playlist_id}"
+                    f"({new_count} < existing {existing_count}, track_count={track_count}) "
+                    f"for {playlist_id}"
                 )
                 conn.close()
                 return

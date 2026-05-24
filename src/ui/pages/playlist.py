@@ -3,7 +3,7 @@ import os
 import tempfile
 from gi.repository import Gtk, Adw, GObject, GLib, Pango, Gdk, Gio, GdkPixbuf
 from api.client import MusicClient
-from ui.utils import AsyncImage, LikeButton, get_yt_music_link
+from ui.utils import AsyncImage, LikeButton, get_yt_music_link, show_toast
 from ui.crop_dialog import ImageCropDialog
 
 # ── GObject Models ────────────────────────────────────────────────────────────
@@ -169,6 +169,14 @@ class PlaylistPage(Adw.Bin):
         self.more_menu_model = Gio.Menu()
         self.playlist_menu = Gio.Menu()
         self.more_btn.set_menu_model(self.more_menu_model)
+        # Lazy rebuild: _refresh_more_menu used to fire from _on_map AND every
+        # update_ui, iterating all editable playlists and rebuilding the Gio.Menu
+        # each time even though the menu is only ever visible when the user
+        # clicks the button. We mark it dirty instead, and rebuild when the
+        # popover is actually about to appear.
+        self._more_menu_dirty = True
+        self._more_menu_pending_is_owned = False
+        self.more_btn.connect("notify::active", self._on_more_btn_active)
         actions_box.append(self.more_btn)
 
         # Actions Row
@@ -180,6 +188,18 @@ class PlaylistPage(Adw.Bin):
         )
         action_add.connect("activate", self._on_add_all_to_playlist)
         self.action_group.add_action(action_add)
+
+        action_show_add = Gio.SimpleAction.new("show_add_all_to_playlist", None)
+        action_show_add.connect("activate", self._on_show_add_all_to_playlist)
+        self.action_group.add_action(action_show_add)
+
+        action_sel_all = Gio.SimpleAction.new("sel_all", None)
+        action_sel_all.connect("activate", lambda a, p: self._select_all())
+        self.action_group.add_action(action_sel_all)
+
+        action_sel_none = Gio.SimpleAction.new("sel_none", None)
+        action_sel_none.connect("activate", lambda a, p: self._deselect_all())
+        self.action_group.add_action(action_sel_none)
 
         action_copy = Gio.SimpleAction.new("copy_link", None)
         action_copy.connect("activate", self.on_copy_link_clicked)
@@ -285,25 +305,10 @@ class PlaylistPage(Adw.Bin):
 
         self.selection_count_label = Gtk.Label(label="0 selected")
         self.selection_count_label.add_css_class("caption")
+        self.selection_count_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.selection_count_label.set_hexpand(True)
+        self.selection_count_label.set_xalign(0.0)
         self.selection_bar.append(self.selection_count_label)
-
-        sel_all_btn = Gtk.Button(label="All")
-        sel_all_btn.add_css_class("flat")
-        sel_all_btn.add_css_class("caption")
-        sel_all_btn.set_tooltip_text("Select all")
-        sel_all_btn.connect("clicked", lambda b: self._select_all())
-        self.selection_bar.append(sel_all_btn)
-
-        sel_none_btn = Gtk.Button(label="None")
-        sel_none_btn.add_css_class("flat")
-        sel_none_btn.add_css_class("caption")
-        sel_none_btn.set_tooltip_text("Deselect all")
-        sel_none_btn.connect("clicked", lambda b: self._deselect_all())
-        self.selection_bar.append(sel_none_btn)
-
-        spacer = Gtk.Box()
-        spacer.set_hexpand(True)
-        self.selection_bar.append(spacer)
 
         sel_play_btn = Gtk.Button(icon_name="media-playback-start-symbolic")
         sel_play_btn.add_css_class("flat")
@@ -311,12 +316,11 @@ class PlaylistPage(Adw.Bin):
         sel_play_btn.connect("clicked", self._on_sel_play)
         self.selection_bar.append(sel_play_btn)
 
-        sel_add_btn = Gtk.MenuButton(icon_name="list-add-symbolic")
-        sel_add_btn.add_css_class("flat")
-        sel_add_btn.set_tooltip_text("Add selected to playlist")
-        self.sel_add_menu = Gio.Menu()
-        sel_add_btn.set_menu_model(self.sel_add_menu)
-        self.selection_bar.append(sel_add_btn)
+        self.sel_add_btn = Gtk.Button(icon_name="list-add-symbolic")
+        self.sel_add_btn.add_css_class("flat")
+        self.sel_add_btn.set_tooltip_text("Add selected to playlist")
+        self.sel_add_btn.connect("clicked", self._on_sel_add_btn_clicked)
+        self.selection_bar.append(self.sel_add_btn)
 
         self.sel_remove_btn = Gtk.Button(icon_name="user-trash-symbolic")
         self.sel_remove_btn.add_css_class("flat")
@@ -326,8 +330,23 @@ class PlaylistPage(Adw.Bin):
         self.sel_remove_btn.set_visible(False)
         self.selection_bar.append(self.sel_remove_btn)
 
-        sel_cancel_btn = Gtk.Button(label="Cancel")
+        # Overflow: stuffs the All/None bulk-selection actions inside a 3-dot
+        # menu so the toolbar fits comfortably on mobile widths. The play /
+        # add / remove icons stay visible since they're the primary actions.
+        self.sel_overflow_btn = Gtk.MenuButton(icon_name="view-more-symbolic")
+        self.sel_overflow_btn.add_css_class("flat")
+        self.sel_overflow_btn.set_tooltip_text("More")
+        sel_overflow_menu = Gio.Menu()
+        sel_overflow_menu.append("Select All", "page.sel_all")
+        sel_overflow_menu.append("Deselect All", "page.sel_none")
+        self.sel_overflow_btn.set_menu_model(sel_overflow_menu)
+        self.selection_bar.append(self.sel_overflow_btn)
+
+        # Cancel is an X icon (no text) so it fits next to the others without
+        # eating horizontal space on narrow viewports.
+        sel_cancel_btn = Gtk.Button(icon_name="window-close-symbolic")
         sel_cancel_btn.add_css_class("flat")
+        sel_cancel_btn.set_tooltip_text("Cancel selection")
         sel_cancel_btn.connect("clicked", lambda b: self.select_btn.set_active(False))
         self.selection_bar.append(sel_cancel_btn)
 
@@ -346,7 +365,12 @@ class PlaylistPage(Adw.Bin):
 
         self.track_store = Gio.ListStore(item_type=TrackItem)
         self.track_filter = Gtk.CustomFilter.new(self._track_filter_func, None)
-        self.filter_model = Gtk.FilterListModel.new(self.track_store, self.track_filter)
+        # Start with no filter attached — Gtk.FilterListModel calls its filter
+        # callback (Python!) for every item on every items-changed, which for
+        # 989-track playlists meant ~1000 Python↔C crossings *per splice* even
+        # when the search bar was empty. We attach the filter on demand from
+        # filter_content() and detach when the search is cleared.
+        self.filter_model = Gtk.FilterListModel.new(self.track_store, None)
 
         self.master_store = Gio.ListStore(item_type=Gio.ListModel)
         self.master_store.append(self.header_store)
@@ -427,12 +451,14 @@ class PlaylistPage(Adw.Bin):
         row.set_hexpand(True)
         row.add_css_class("song-row")
 
-        # Checkbox for multi-select (hidden by default)
-        check = Gtk.CheckButton()
-        check.set_valign(Gtk.Align.CENTER)
-        check.set_visible(False)
-        row.append(check)
-        row._lv_check = check
+        # Lazy widgets — created on first use by _ensure_* helpers. Most
+        # tracks aren't explicit/downloaded/in-album-view and multi-select
+        # is off by default, so skipping these in setup cuts ~4 widget
+        # allocations × ~25 visible rows during a cold playlist render.
+        row._lv_check = None
+        row._lv_track_num = None
+        row._lv_explicit_badge = None
+        row._lv_dl_icon = None
 
         from ui.utils import AsyncPicture
 
@@ -441,17 +467,6 @@ class PlaylistPage(Adw.Bin):
         row.append(img)
         row._lv_img = img
         row._lv_player_handler = None
-
-        # Track number label (for album view)
-        track_num = Gtk.Label()
-        track_num.add_css_class("dim-label")
-        track_num.add_css_class("caption")
-        track_num.set_valign(Gtk.Align.CENTER)
-        track_num.set_halign(Gtk.Align.CENTER)
-        track_num.set_size_request(40, 40)
-        track_num.set_visible(False)
-        row.append(track_num)
-        row._lv_track_num = track_num
 
         # Main Title / Subtitle Box
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
@@ -462,34 +477,44 @@ class PlaylistPage(Adw.Bin):
         title_label.set_halign(Gtk.Align.START)
         title_label.set_ellipsize(Pango.EllipsizeMode.END)
         title_label.set_lines(1)
+        # hexpand was True here, which pushed the trailing badges (explicit /
+        # downloaded) to the far right of the row instead of letting them sit
+        # next to the title. The title_box below now hexpands instead, so the
+        # label can still ellipsize to the row's available width without
+        # gobbling all of it.
+        title_label.set_hexpand(False)
+        title_label.set_xalign(0.0)
+        # Without an explicit minimum, ellipsize END refuses to shrink the
+        # label below its full text natural width — which pushed the row
+        # past the viewport on narrow widths (mobile + multi-select).
+        title_label.set_width_chars(1)
         row._title_label = title_label
 
         subtitle_label = Gtk.Label()
         subtitle_label.set_halign(Gtk.Align.START)
         subtitle_label.set_ellipsize(Pango.EllipsizeMode.END)
         subtitle_label.set_lines(1)
+        subtitle_label.set_hexpand(True)
+        subtitle_label.set_xalign(0.0)
+        subtitle_label.set_width_chars(1)
         subtitle_label.add_css_class("dim-label")
         subtitle_label.add_css_class("caption")
         row._subtitle_label = subtitle_label
 
         title_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        title_box.set_hexpand(True)
         title_box.append(title_label)
-        row._title_label = title_label
 
-        explicit_badge = Gtk.Label(label="E")
-        explicit_badge.add_css_class("explicit-badge")
-        explicit_badge.set_valign(Gtk.Align.CENTER)
-        explicit_badge.set_visible(False)
-        title_box.append(explicit_badge)
-        row._lv_explicit_badge = explicit_badge
+        # Trailing spacer soaks up extra horizontal space so the title +
+        # badges stay packed at the start of the row. Late-inserted badges
+        # are inserted *before* this spacer (see _ensure_explicit_badge /
+        # _ensure_dl_icon below).
+        title_spacer = Gtk.Box()
+        title_spacer.set_hexpand(True)
+        title_box.append(title_spacer)
+        row._lv_title_spacer = title_spacer
 
-        dl_icon = Gtk.Image.new_from_icon_name("folder-download-symbolic")
-        dl_icon.set_pixel_size(14)
-        dl_icon.add_css_class("dim-label")
-        dl_icon.set_valign(Gtk.Align.CENTER)
-        dl_icon.set_visible(False)
-        title_box.append(dl_icon)
-        row._lv_dl_icon = dl_icon
+        row._lv_title_box = title_box  # ensure_explicit_badge/_ensure_dl_icon append here
 
         vbox.append(title_box)
         vbox.append(subtitle_label)
@@ -531,6 +556,53 @@ class PlaylistPage(Adw.Bin):
 
         bin_widget._lv_track_ui = row
 
+    # ── Lazy widget helpers ───────────────────────────────────────────────────
+
+    def _ensure_check(self, row):
+        if row._lv_check is None:
+            check = Gtk.CheckButton()
+            check.set_valign(Gtk.Align.CENTER)
+            row.prepend(check)
+            row._lv_check = check
+        return row._lv_check
+
+    def _ensure_track_num(self, row):
+        if row._lv_track_num is None:
+            lbl = Gtk.Label()
+            lbl.add_css_class("dim-label")
+            lbl.add_css_class("caption")
+            lbl.set_valign(Gtk.Align.CENTER)
+            lbl.set_halign(Gtk.Align.CENTER)
+            lbl.set_size_request(40, 40)
+            # Slot in just after the img (matches the original setup order).
+            row.insert_child_after(lbl, row._lv_img)
+            row._lv_track_num = lbl
+        return row._lv_track_num
+
+    def _ensure_explicit_badge(self, row):
+        if row._lv_explicit_badge is None:
+            badge = Gtk.Label(label="E")
+            badge.add_css_class("explicit-badge")
+            badge.set_valign(Gtk.Align.CENTER)
+            # Insert before the trailing spacer so the badge sits next to
+            # the title, not at the right edge of the row.
+            row._lv_title_box.insert_child_after(badge, row._title_label)
+            row._lv_explicit_badge = badge
+        return row._lv_explicit_badge
+
+    def _ensure_dl_icon(self, row):
+        if row._lv_dl_icon is None:
+            icon = Gtk.Image.new_from_icon_name("folder-download-symbolic")
+            icon.set_pixel_size(14)
+            icon.add_css_class("dim-label")
+            icon.set_valign(Gtk.Align.CENTER)
+            # Slot in after the explicit badge if it exists, otherwise
+            # right after the title. Either way, kept before the spacer.
+            anchor = row._lv_explicit_badge or row._title_label
+            row._lv_title_box.insert_child_after(icon, anchor)
+            row._lv_dl_icon = icon
+        return row._lv_dl_icon
+
     def _bind_list_item(self, factory, list_item):
         bin_widget = list_item.get_child()
         item = list_item.get_item()
@@ -550,19 +622,22 @@ class PlaylistPage(Adw.Bin):
         row = bin_widget._lv_track_ui
         t = item.data
 
-        # Multi-select checkbox
+        # Multi-select checkbox — lazy-created only when multi-select mode is
+        # active. Out of multi-select (the common case), we skip even touching
+        # row._lv_check.
         video_id = t.get("videoId")
         is_selected = video_id in getattr(self, "_selected_video_ids", set())
         if self._multi_select_mode:
-            row._lv_check.set_visible(True)
+            check = self._ensure_check(row)
+            check.set_visible(True)
             if hasattr(row, "_lv_check_handler") and row._lv_check_handler:
-                row._lv_check.disconnect(row._lv_check_handler)
-            row._lv_check.set_active(is_selected)
-            row._lv_check_handler = row._lv_check.connect(
+                check.disconnect(row._lv_check_handler)
+            check.set_active(is_selected)
+            row._lv_check_handler = check.connect(
                 "toggled",
                 lambda cb, vid=video_id, r=row: self._toggle_track_selection(vid, r),
             )
-        else:
+        elif row._lv_check is not None:
             row._lv_check.set_visible(False)
             if hasattr(row, "_lv_check_handler") and row._lv_check_handler:
                 row._lv_check.disconnect(row._lv_check_handler)
@@ -587,11 +662,13 @@ class PlaylistPage(Adw.Bin):
             # The list contains a header at index 0, so the first track is at index 1.
             # Using 'position' as the track number correctly gives us 1-based indexing.
             track_num = position
-            row._lv_track_num.set_label(str(track_num))
-            row._lv_track_num.set_visible(True)
+            tn = self._ensure_track_num(row)
+            tn.set_label(str(track_num))
+            tn.set_visible(True)
             row._lv_img.set_visible(False)
         else:
-            row._lv_track_num.set_visible(False)
+            if row._lv_track_num is not None:
+                row._lv_track_num.set_visible(False)
             row._lv_img.set_visible(True)
             root = self.get_root()
             row._lv_img.set_compact(
@@ -611,33 +688,48 @@ class PlaylistPage(Adw.Bin):
             f"{dur_sec // 60}:{dur_sec % 60:02d}" if dur_sec else t.get("duration", "")
         )
         row._lv_dur_lbl.set_label(dur_text or "")
-        row._lv_dur_lbl.set_visible(bool(dur_text))
+        # In multi-select mode, the checkbox at the start of the row eats
+        # ~32px of horizontal space — on mobile that was enough to push the
+        # right-side duration + like button off-screen. Hide them while
+        # selecting; they come back when the user exits select mode.
+        row._lv_dur_lbl.set_visible(
+            bool(dur_text) and not self._multi_select_mode
+        )
 
         is_explicit = t.get("isExplicit") or t.get("explicit", False)
-        row._lv_explicit_badge.set_visible(bool(is_explicit))
+        if is_explicit:
+            self._ensure_explicit_badge(row).set_visible(True)
+        elif row._lv_explicit_badge is not None:
+            row._lv_explicit_badge.set_visible(False)
 
         row._lv_video_id = t.get("videoId", "")
         if t.get("videoId"):
             vid = t["videoId"]
             row._lv_like_btn.set_data(vid, t.get("likeStatus", "INDIFFERENT"))
-            row._lv_like_btn.set_visible(True)
-            # Downloaded / queued indicator
+            # Hidden in multi-select mode for the same reason dur_lbl is —
+            # checkbox + content overflows narrow viewports otherwise.
+            row._lv_like_btn.set_visible(not self._multi_select_mode)
+            # Downloaded / queued indicator — lazy-create only when actually
+            # showing the icon. Most tracks are neither downloaded nor queued.
             dm = self.player.download_manager
             if dm.is_downloaded(vid):
-                row._lv_dl_icon.set_from_icon_name("folder-download-symbolic")
-                row._lv_dl_icon.remove_css_class("queued-icon")
-                row._lv_dl_icon.set_visible(True)
+                icon = self._ensure_dl_icon(row)
+                icon.set_from_icon_name("folder-download-symbolic")
+                icon.remove_css_class("queued-icon")
+                icon.set_visible(True)
             elif dm.is_queued(vid):
-                row._lv_dl_icon.set_from_icon_name("content-loading-symbolic")
-                row._lv_dl_icon.add_css_class("queued-icon")
-                row._lv_dl_icon.set_visible(True)
-            else:
+                icon = self._ensure_dl_icon(row)
+                icon.set_from_icon_name("content-loading-symbolic")
+                icon.add_css_class("queued-icon")
+                icon.set_visible(True)
+            elif row._lv_dl_icon is not None:
                 row._lv_dl_icon.remove_css_class("queued-icon")
                 row._lv_dl_icon.set_visible(False)
         else:
             row._lv_like_btn.set_visible(False)
-            row._lv_dl_icon.remove_css_class("queued-icon")
-            row._lv_dl_icon.set_visible(False)
+            if row._lv_dl_icon is not None:
+                row._lv_dl_icon.remove_css_class("queued-icon")
+                row._lv_dl_icon.set_visible(False)
 
         has_id = bool(t.get("videoId"))
         # Grey out songs unavailable offline
@@ -713,11 +805,13 @@ class PlaylistPage(Adw.Bin):
         row._lv_dur_lbl.set_label("")
         row._lv_dur_lbl.set_visible(False)
         row.remove_css_class("playing")
-        row._lv_explicit_badge.set_visible(False)
+        if row._lv_explicit_badge is not None:
+            row._lv_explicit_badge.set_visible(False)
         row._lv_like_btn.set_visible(False)
-        row._lv_check.set_visible(False)
+        if row._lv_check is not None:
+            row._lv_check.set_visible(False)
         row.remove_css_class("selected")
-        if hasattr(row, "_lv_check_handler") and row._lv_check_handler:
+        if hasattr(row, "_lv_check_handler") and row._lv_check_handler and row._lv_check is not None:
             row._lv_check.disconnect(row._lv_check_handler)
             row._lv_check_handler = None
         row._lv_video_data = None
@@ -745,7 +839,7 @@ class PlaylistPage(Adw.Bin):
             vid = track.get("videoId") if track else None
             if vid:
                 self._toggle_track_selection(vid, row)
-                if hasattr(row, "_lv_check"):
+                if row._lv_check is not None:
                     row._lv_check.set_active(vid in self._selected_video_ids)
             return
 
@@ -779,15 +873,9 @@ class PlaylistPage(Adw.Bin):
                 start_index = i
                 break
 
-        print(
-            f"\033[95m[DEBUG-CLICK] vid={video_id} found_at={start_index} "
-            f"queue_len={len(tracks_to_queue)}\033[0m"
-        )
-
         if start_index < 0:
             # Click target wasn't in tracks_to_queue (shouldn't happen, but
             # don't silently fall back to playing the first song).
-            print("[DEBUG-CLICK] WARNING: click target not in queue, aborting")
             return
 
         self.player.set_queue(
@@ -810,7 +898,26 @@ class PlaylistPage(Adw.Bin):
         return self.current_filter_text in title or self.current_filter_text in artist
 
     def filter_content(self, text):
-        self.current_filter_text = text.lower().strip()
+        # Debounce: the search-changed signal fires per-keystroke. For a
+        # 989-track playlist each call iterates original_tracks + splices,
+        # which is ~50ms of UI freeze every keypress. Defer the real work
+        # by ~150ms so only the final keystroke does it.
+        pending = text.lower().strip()
+        self._pending_filter_text = pending
+        existing = getattr(self, "_filter_debounce_id", None)
+        if existing:
+            GLib.source_remove(existing)
+        # Empty (clearing) is cheap and the user expects the snap-back to be
+        # immediate, so run the empty case without a delay.
+        delay = 0 if not pending else 150
+        self._filter_debounce_id = GLib.timeout_add(
+            delay, self._filter_content_apply
+        )
+
+    def _filter_content_apply(self):
+        self._filter_debounce_id = None
+        text = getattr(self, "_pending_filter_text", "")
+        self.current_filter_text = text
 
         # Search all data in original_tracks and rebuild the track store with matches
         if hasattr(self, "original_tracks") and self.original_tracks:
@@ -844,17 +951,25 @@ class PlaylistPage(Adw.Bin):
                 items = [TrackItem(t) for t in self.current_tracks]
                 self.track_store.splice(0, self.track_store.get_n_items(), items)
 
-            # Always re-enable the GTK filter so any tracks added later
-            # (lazy-load, background fetch) are also filtered
-            self.filter_model.set_filter(self.track_filter)
+            # Re-attach the GTK filter only while a search is active so
+            # tracks added later (lazy-load, background fetch) get filtered.
+            # When the search is cleared we leave it detached so future
+            # splices don't pay 1 Python callback per item for no reason.
+            if self.current_filter_text:
+                self.filter_model.set_filter(self.track_filter)
+            else:
+                self.filter_model.set_filter(None)
             if self._multi_select_mode:
                 self._update_selection_count()
-            return
+            return False
 
-        # Fallback: use the GTK filter
+        # Fallback: use the GTK filter (need it attached for this path)
+        if self.filter_model.get_filter() is None:
+            self.filter_model.set_filter(self.track_filter)
         self.track_filter.changed(Gtk.FilterChange.DIFFERENT)
         if self._multi_select_mode:
             self._update_selection_count()
+        return False
 
     # ── Store helpers ─────────────────────────────────────────────────────────
 
@@ -993,6 +1108,17 @@ class PlaylistPage(Adw.Bin):
         self._dl_done_id = dm.connect("item-done", self._on_dl_item_done)
 
     def _refresh_more_menu(self, is_owned=False):
+        """Mark the more-menu as needing a rebuild; defer the actual work
+        until the popover is about to open."""
+        self._more_menu_pending_is_owned = is_owned
+        self._more_menu_dirty = True
+
+    def _on_more_btn_active(self, btn, _pspec):
+        if btn.get_active() and self._more_menu_dirty:
+            self._rebuild_more_menu(self._more_menu_pending_is_owned)
+            self._more_menu_dirty = False
+
+    def _rebuild_more_menu(self, is_owned=False):
         from ui.utils import is_online
 
         self.more_menu_model.remove_all()
@@ -1003,16 +1129,12 @@ class PlaylistPage(Adw.Bin):
         queue_section.append("Add to Queue", "page.add_all_to_queue")
         self.more_menu_model.append_section(None, queue_section)
 
-        # 1. Add All to Playlist Submenu
-        self.playlist_menu.remove_all()
-        playlists = self.client.get_editable_playlists()
-        for p in playlists:
-            title = p.get("title", "Untitled")
-            pid = p.get("playlistId")
-            if pid:
-                self.playlist_menu.append(title, f"page.add_all_to_playlist('{pid}')")
-
-        self.more_menu_model.append_submenu("Add all to Playlist", self.playlist_menu)
+        # 1. Add All to Playlist — opens the custom popover (covers + search
+        # + recents-first) instead of a plain Gio.Menu submenu.
+        if self.client.get_editable_playlists():
+            self.more_menu_model.append(
+                "Add all to Playlist…", "page.show_add_all_to_playlist"
+            )
 
         # 2. Start Radio (online only)
         if is_online() and (getattr(self, "_audio_playlist_id", None) or self.playlist_id):
@@ -1083,11 +1205,26 @@ class PlaylistPage(Adw.Bin):
             self._show_toast(f"Downloading {len(all_tracks)} songs...")
 
     def _on_add_all_to_playlist(self, action, param):
-        playlist_id = param.get_string()
-        video_ids = [t.get("videoId") for t in self.current_tracks if t.get("videoId")]
+        self._do_add_all_to_playlist(param.get_string())
 
-        if not video_ids:
+    def _on_show_add_all_to_playlist(self, action, param):
+        from ui.widgets.add_to_playlist import AddToPlaylistPopover
+        pop = AddToPlaylistPopover(
+            self.player,
+            on_select=self._do_add_all_to_playlist,
+            parent=self.more_btn,
+        )
+        pop.popup()
+
+    def _do_add_all_to_playlist(self, playlist_id):
+        video_ids = [
+            t.get("videoId") for t in self.current_tracks if t.get("videoId")
+        ]
+        if not playlist_id or not video_ids:
             return
+
+        from ui.widgets.add_to_playlist import mark_playlist_used
+        mark_playlist_used(playlist_id)
 
         def thread_func():
             success = self.client.add_playlist_items(playlist_id, video_ids)
@@ -1145,9 +1282,7 @@ class PlaylistPage(Adw.Bin):
             root.library_page.load_library()
 
     def _show_toast(self, message):
-        root = self.get_root()
-        if hasattr(root, "add_toast"):
-            root.add_toast(message)
+        show_toast(self, message)
 
     def _remove_track_by_entity_id(self, entity_id):
         """Remove a track from local data by entityId and refresh the view."""
@@ -1173,16 +1308,17 @@ class PlaylistPage(Adw.Bin):
                 if bin_widget and hasattr(bin_widget, "get_child")
                 else None
             )
-            if row and hasattr(row, "_lv_dl_icon") and hasattr(row, "_lv_video_id"):
-                if row._lv_video_id == video_id:
-                    if downloaded:
-                        row._lv_dl_icon.set_from_icon_name("folder-download-symbolic")
-                        row._lv_dl_icon.remove_css_class("queued-icon")
-                        row._lv_dl_icon.set_visible(True)
-                    elif queued:
-                        row._lv_dl_icon.set_from_icon_name("content-loading-symbolic")
-                        row._lv_dl_icon.add_css_class("queued-icon")
-                        row._lv_dl_icon.set_visible(True)
+            if row and hasattr(row, "_lv_video_id") and row._lv_video_id == video_id:
+                if downloaded:
+                    icon = self._ensure_dl_icon(row)
+                    icon.set_from_icon_name("folder-download-symbolic")
+                    icon.remove_css_class("queued-icon")
+                    icon.set_visible(True)
+                elif queued:
+                    icon = self._ensure_dl_icon(row)
+                    icon.set_from_icon_name("content-loading-symbolic")
+                    icon.add_css_class("queued-icon")
+                    icon.set_visible(True)
             child = child.get_next_sibling()
 
     def _on_dl_indicator_update(self, dm, video_id):
@@ -1289,102 +1425,228 @@ class PlaylistPage(Adw.Bin):
         """Render immediately from DownloadDB's playlist cache if we have it.
         Live data from the API will replace these rows when it arrives.
         Silently no-ops on any failure — this is an optimization, never a
-        correctness requirement. Rebuilds a header that looks identical to
-        the fully-loaded state (privacy/year/author-with-link)."""
-        try:
-            if (
-                not playlist_id
-                or playlist_id.startswith("UPLOAD")
-                or playlist_id == "DOWNLOADS"
-                or playlist_id == "HISTORY"
-            ):
-                return
-            from player.downloads import get_download_db
+        correctness requirement.
 
-            cached = get_download_db().get_cached_playlist(playlist_id)
-            if not cached:
-                return
-            tracks = cached.get("tracks") or []
-            if not tracks:
-                return
-            meta = cached.get("meta") or {}
-            title = (cached.get("title") or (initial_data or {}).get("title") or "")
+        The DB read + JSON parse (~500KB for a 1000-track playlist) and the
+        meta-string building run on a worker thread so the page push animation
+        isn't stalled by them; the UI updates marshal back to the main thread.
+        """
+        if (
+            not playlist_id
+            or playlist_id.startswith("UPLOAD")
+            or playlist_id == "DOWNLOADS"
+            or playlist_id == "HISTORY"
+        ):
+            return
 
-            author_markup = self._build_author_markup(
-                meta.get("author_raw"), cached.get("author")
-            )
+        token = getattr(self, "_track_populate_token", 0)
 
-            # Build meta1 (header first line) the same way the live path does.
-            meta1_parts = []
-            if playlist_id.startswith("MPRE") or playlist_id.startswith("OLAK"):
-                # album_type isn't cached per-row but we can infer from size
-                track_count_for_type = len(tracks)
-                if track_count_for_type == 1:
-                    meta1_parts.append("Single")
-                elif 2 <= track_count_for_type <= 6:
-                    meta1_parts.append("EP")
+        def worker():
+            try:
+                from player.downloads import get_download_db
+                cached = get_download_db().get_cached_playlist(playlist_id)
+                if not cached:
+                    return
+                tracks = cached.get("tracks") or []
+                if not tracks:
+                    return
+                meta = cached.get("meta") or {}
+                title = (
+                    cached.get("title")
+                    or (initial_data or {}).get("title")
+                    or ""
+                )
+
+                author_markup = self._build_author_markup(
+                    meta.get("author_raw"), cached.get("author")
+                )
+
+                meta1_parts = []
+                if playlist_id.startswith("MPRE") or playlist_id.startswith("OLAK"):
+                    n = len(tracks)
+                    if n == 1:
+                        meta1_parts.append("Single")
+                    elif 2 <= n <= 6:
+                        meta1_parts.append("EP")
+                    else:
+                        meta1_parts.append("Album")
                 else:
-                    meta1_parts.append("Album")
-            else:
-                privacy = (meta.get("privacy") or "").strip()
-                meta1_parts.append(privacy.capitalize() if privacy else "Playlist")
-            year = meta.get("year")
-            if year:
-                meta1_parts.append(str(year))
-            if author_markup:
-                meta1_parts.append(author_markup)
-            meta1 = " • ".join(meta1_parts)
+                    privacy = (meta.get("privacy") or "").strip()
+                    meta1_parts.append(privacy.capitalize() if privacy else "Playlist")
+                year = meta.get("year")
+                if year:
+                    meta1_parts.append(str(year))
+                if author_markup:
+                    meta1_parts.append(author_markup)
+                meta1 = " • ".join(meta1_parts)
 
-            total_seconds = (
-                meta.get("duration_seconds")
-                or sum(t.get("duration_seconds", 0) for t in tracks)
+                total_seconds = (
+                    meta.get("duration_seconds")
+                    or sum(t.get("duration_seconds", 0) for t in tracks)
+                )
+                hours = total_seconds // 3600
+                minutes = (total_seconds % 3600) // 60
+                duration_str = (
+                    f"{hours} hr {minutes} min"
+                    if hours > 0 else f"{minutes} min"
+                )
+                song_text = "song" if len(tracks) == 1 else "songs"
+                meta2 = (
+                    f"{len(tracks)} {song_text} • {duration_str}"
+                    if total_seconds else f"{len(tracks)} {song_text}"
+                )
+
+                thumbnails = meta.get("thumbnails") or []
+                if not thumbnails and initial_data and initial_data.get("thumb"):
+                    thumbnails = [{"url": initial_data["thumb"]}]
+
+                # Pre-build TrackItems off-thread — they're trivial wrappers
+                # but ~1000 of them in the apply was still a measurable hit.
+                track_items = [TrackItem(t) for t in tracks]
+
+                payload = {
+                    "title": title,
+                    "description": meta.get("description") or "",
+                    "meta1": meta1,
+                    "meta2": meta2,
+                    "thumbnails": thumbnails,
+                    "tracks": tracks,
+                    "track_items": track_items,
+                }
+                # Header (title, cover, meta) renders during the page-push
+                # animation so the page doesn't look empty. The track splice
+                # follows right after — Gtk.ListView virtualizes, so only the
+                # visible rows get widget-allocated regardless of list size.
+                GLib.idle_add(self._apply_disk_cache_header, token, payload)
+                GLib.idle_add(self._apply_disk_cache_tracks, token, payload)
+            except Exception as e:
+                print(f"[DISK-CACHE] optimistic render failed: {e}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_disk_cache_header(self, token, payload):
+        """Cheap header updates: title, description, meta strings, cover.
+        Safe to run during the page-push animation."""
+        if token != getattr(self, "_track_populate_token", 0):
+            return False
+        try:
+            title = payload["title"]
+            description = payload["description"]
+            thumbnails = payload["thumbnails"]
+
+            self.stack.set_visible_child_name("content")
+            self.content_spinner.set_visible(True)
+            self.playlist_title_text = title
+            self.playlist_description_text = description
+            self.playlist_name_label.set_label(title)
+            self.meta_label.set_markup(payload["meta1"])
+            self.stats_label.set_label(payload["meta2"])
+
+            # Sort bar: update_ui owns this normally, but the disk-cache path
+            # skips update_ui to avoid its chunked pump. Compute is_album from
+            # the playlist id (same rule update_ui uses) so the sort dropdown
+            # shows up alongside the rest of the header instead of waiting
+            # for the live API fetch.
+            pid = self.playlist_id or ""
+            is_album = (
+                pid.startswith("MPRE")
+                or pid.startswith("OLAK")
+                or pid.startswith("FEmusic_library_privately_owned")
             )
-            hours = total_seconds // 3600
-            minutes = (total_seconds % 3600) // 60
-            duration_str = f"{hours} hr {minutes} min" if hours > 0 else f"{minutes} min"
-            song_text = "song" if len(tracks) == 1 else "songs"
-            meta2 = f"{len(tracks)} {song_text} • {duration_str}" if total_seconds else f"{len(tracks)} {song_text}"
+            self._is_album_view = is_album
+            self.sort_row.set_visible(bool(payload.get("tracks")) and not is_album)
 
+            if description and description.strip():
+                self._full_description = description
+                self._description_expanded = False
+                self.read_more_btn.set_markup("<a href='toggle'>Read more</a>")
+                if len(description) > 200:
+                    truncated = description[:200].rsplit(" ", 1)[0] + "..."
+                    self.description_label.set_label(truncated)
+                    self.read_more_btn.set_visible(True)
+                else:
+                    self.description_label.set_label(description)
+                    self.read_more_btn.set_visible(False)
+                self.desc_box.set_visible(True)
+            else:
+                self.desc_box.set_visible(False)
+
+            if thumbnails:
+                url = thumbnails[-1]["url"]
+                if self.cover_img.url != url:
+                    self._is_previewing_cover = False
+                    from player.downloads import get_music_dir, _sanitize_filename
+                    cover_path = os.path.join(
+                        get_music_dir(), "Playlists",
+                        f"{_sanitize_filename(title)}.jpg",
+                    )
+                    if os.path.exists(cover_path):
+                        self.cover_img.load_url(f"file://{cover_path}")
+                    else:
+                        self.cover_img.load_url(url)
+        except Exception as e:
+            print(f"[DISK-CACHE] header apply failed: {e}")
+        return False
+
+    def _apply_disk_cache_tracks(self, token, payload):
+        """Splice the prepared TrackItems into the store in two stages:
+        a visible-batch first so the user sees rows immediately, then the
+        long tail deferred to a separate idle so the heavy items-changed
+        propagation + ListView measure pass doesn't all land in one frame.
+
+        Worker has already done JSON parse + TrackItem construction; the
+        main thread only owes the splice itself.
+        """
+        if token != getattr(self, "_track_populate_token", 0):
+            return False
+        try:
+            tracks = payload["tracks"]
+            items = payload["track_items"]
             self.original_tracks = list(tracks)
             self.current_tracks = list(tracks)
 
-            # Prefer the cached playlist cover; if we don't have one,
-            # fall back to whatever `initial_data` carried (usually the
-            # thumb stored on the library grid card). Never reach for the
-            # first track's cover — that was producing wrong header art
-            # for playlists whose actual cover hadn't been cached yet.
-            thumbnails = meta.get("thumbnails") or []
-            if not thumbnails and initial_data and initial_data.get("thumb"):
-                thumbnails = [{"url": initial_data["thumb"]}]
+            self._clear_track_store()
+            # _clear_track_store bumps the populate token. The tail callback
+            # must check against the post-clear token, not the pre-clear one
+            # the worker captured — otherwise the tail always bails and only
+            # the first 50 items render. Re-capture here.
+            tail_token = self._track_populate_token
+            if items:
+                # First batch sized to comfortably cover the viewport +
+                # prefetch. ListView allocates widgets only for visible
+                # rows in this batch — the rest just sit in the model.
+                FIRST = 50
+                head = items[:FIRST]
+                self.track_store.splice(0, 0, head)
+                tail = items[FIRST:]
+                if tail:
+                    # Yield to the event loop so the visible rows render
+                    # before we hit the model again with the long tail.
+                    # The tail splice only appends to the model — no new
+                    # widget binds — but the items-changed propagation
+                    # through FlattenListModel + ListView's measure pass
+                    # is still real work and we'd rather it land in a
+                    # separate frame.
+                    GLib.idle_add(
+                        self._apply_disk_cache_tail, tail_token, tail,
+                        priority=GLib.PRIORITY_LOW,
+                    )
 
-            # Pass track_count=None (not len(tracks)!) so update_ui doesn't
-            # conclude we already have the full list and set
-            # is_fully_fetched=True — that was causing _start_background_full_fetch
-            # to short-circuit on the very next load_playlist call, leaving
-            # the queue permanently capped at whatever the cache happened
-            # to contain (the "still 300" symptom).
-            self.update_ui(
-                title,
-                meta.get("description") or "",
-                meta1,
-                meta2,
-                thumbnails,
-                tracks,
-                False,
-                None,
-                False,
-            )
-            # Force is_fully_fetched back to False: update_ui's tail-check
-            # (`len(current_tracks) == len(original_tracks)`) will otherwise
-            # set it True when we populate both from the cache, which then
-            # makes _start_background_full_fetch short-circuit on the very
-            # next load_playlist call. That was why cached-opens topped out
-            # at whatever the cache happened to hold (e.g. 700/805).
+            self.empty_label.set_visible(not items)
             self.is_fully_fetched = False
-            # Keep the small spinner visible — we're still fetching fresh data.
             self.content_spinner.set_visible(True)
         except Exception as e:
-            print(f"[DISK-CACHE] optimistic render failed: {e}")
+            print(f"[DISK-CACHE] tracks apply failed: {e}")
+        return False
+
+    def _apply_disk_cache_tail(self, token, tail):
+        if token != getattr(self, "_track_populate_token", 0):
+            return False
+        try:
+            self.track_store.splice(self.track_store.get_n_items(), 0, tail)
+        except Exception as e:
+            print(f"[DISK-CACHE] tail apply failed: {e}")
+        return False
 
     def _build_author_markup(self, author_raw, author_plain):
         """Reconstruct the `<a href='artist:ID'>Name</a>` markup used by the
@@ -2138,6 +2400,21 @@ class PlaylistPage(Adw.Bin):
         sort_type = self.sort_dropdown.get_selected()
         if sort_type != 0 or getattr(self, "_sort_descending", False):
             self.reorder_playlist(sort_type)
+        else:
+            # Default sort: the bg fetch may have arrived with a different
+            # tracklist than the disk-cached one we rendered (external edit
+            # on YT — added/removed/reordered tracks). Diff and refresh the
+            # store so the user sees the up-to-date version without having
+            # to hit the manual refresh button.
+            new_ids = [t.get("videoId") for t in (tracks or [])]
+            cur_ids = [t.get("videoId") for t in self.current_tracks]
+            if new_ids and new_ids != cur_ids and self.current_filter_text == "":
+                print(
+                    f"[PLAYLIST] external edits detected "
+                    f"({len(cur_ids)} cached → {len(new_ids)} live), refreshing"
+                )
+                self.current_tracks = list(tracks)
+                self._populate_tracks_chunked(tracks)
 
         # Hide the inline loading spinner now that we have all tracks.
         if hasattr(self, "content_spinner"):
@@ -2232,9 +2509,6 @@ class PlaylistPage(Adw.Bin):
                 start_index = i
                 break
 
-        print(
-            f"\033[94m[DEBUG-PLAYLIST] on_song_activated. playlist_id={self.playlist_id}\033[0m"
-        )
         self.player.set_queue(
             tracks_to_queue,
             start_index,
@@ -2276,24 +2550,29 @@ class PlaylistPage(Adw.Bin):
             row.add_css_class("selected")
         else:
             row.remove_css_class("selected")
-        if hasattr(row, "_lv_check"):
+        # Only touch the checkbox if we're in multi-select mode (otherwise it
+        # shouldn't exist or shouldn't matter). Ensure-create when toggling on.
+        if selected or row._lv_check is not None:
+            check = self._ensure_check(row)
             if hasattr(row, "_lv_check_handler") and row._lv_check_handler:
-                row._lv_check.disconnect(row._lv_check_handler)
+                check.disconnect(row._lv_check_handler)
                 row._lv_check_handler = None
-            row._lv_check.set_active(selected)
+            check.set_active(selected)
             vid = (
                 getattr(row, "_lv_full_track", {}).get("videoId")
                 if hasattr(row, "_lv_full_track") and row._lv_full_track
                 else None
             )
             if vid:
-                row._lv_check_handler = row._lv_check.connect(
+                row._lv_check_handler = check.connect(
                     "toggled",
                     lambda cb, v=vid, r=row: self._toggle_track_selection(v, r),
                 )
 
     def _refresh_all_row_visuals(self):
-        """Walk all visible ListView rows and update checkbox/highlight state."""
+        """Walk all visible ListView rows and update checkbox/highlight state.
+        Also toggles the right-side dur_lbl + like_btn since multi-select
+        mode hides them to make room for the checkbox on narrow viewports."""
         child = self.songs_list.get_first_child()
         while child:
             # child is the list row, its first child is the Adw.Bin
@@ -2303,11 +2582,23 @@ class PlaylistPage(Adw.Bin):
                 vid = row._lv_full_track.get("videoId")
                 is_sel = vid in self._selected_video_ids if vid else False
                 if self._multi_select_mode:
-                    row._lv_check.set_visible(True)
+                    self._ensure_check(row).set_visible(True)
                     self._apply_row_selection(row, is_sel)
                 else:
-                    row._lv_check.set_visible(False)
+                    if row._lv_check is not None:
+                        row._lv_check.set_visible(False)
                     row.remove_css_class("selected")
+                # Right-side widgets: hidden in multi-select to give the
+                # checkbox + title labels room on narrow viewports.
+                if hasattr(row, "_lv_like_btn"):
+                    row._lv_like_btn.set_visible(
+                        bool(vid) and not self._multi_select_mode
+                    )
+                if hasattr(row, "_lv_dur_lbl"):
+                    has_dur = bool(row._lv_dur_lbl.get_label())
+                    row._lv_dur_lbl.set_visible(
+                        has_dur and not self._multi_select_mode
+                    )
             child = child.get_next_sibling()
 
     def _get_visible_tracks(self):
@@ -2359,13 +2650,19 @@ class PlaylistPage(Adw.Bin):
         return self._sort_tracks(selected)
 
     def _refresh_sel_add_menu(self):
-        self.sel_add_menu.remove_all()
-        playlists = self.client.get_editable_playlists()
-        for p in playlists:
-            title = p.get("title", "Untitled")
-            pid = p.get("playlistId")
-            if pid:
-                self.sel_add_menu.append(title, f"page.sel_add_to_playlist('{pid}')")
+        # The selection toolbar's add-to-playlist button now opens the custom
+        # popover on click — no Gio.Menu rebuild needed. Keep the method
+        # name as a no-op so existing call sites stay valid.
+        pass
+
+    def _on_sel_add_btn_clicked(self, btn):
+        from ui.widgets.add_to_playlist import AddToPlaylistPopover
+        pop = AddToPlaylistPopover(
+            self.player,
+            on_select=self._do_sel_add_to_playlist,
+            parent=btn,
+        )
+        pop.popup()
 
     def _on_sel_play(self, btn):
         tracks = self._get_selected_tracks()
@@ -2373,11 +2670,18 @@ class PlaylistPage(Adw.Bin):
             self.player.set_queue(tracks, 0)
 
     def _on_sel_add_to_playlist(self, action, param):
-        target_pid = param.get_string()
+        self._do_sel_add_to_playlist(param.get_string())
+
+    def _do_sel_add_to_playlist(self, target_pid):
+        if not target_pid:
+            return
         tracks = self._get_selected_tracks()
         video_ids = [t.get("videoId") for t in tracks if t.get("videoId")]
         if not video_ids:
             return
+
+        from ui.widgets.add_to_playlist import mark_playlist_used
+        mark_playlist_used(target_pid)
 
         def thread_func():
             success = self.client.add_playlist_items(target_pid, video_ids)
@@ -2656,52 +2960,54 @@ class PlaylistPage(Adw.Bin):
             )
             group.add_action(a_radio)
 
-        if has_selection or vid:
-            playlists = self.client.get_editable_playlists()
-            if playlists:
-                label = (
-                    f"Add {len(self._selected_video_ids)} to Playlist"
-                    if has_selection
-                    else "Add to Playlist"
+        if (has_selection or vid) and self.client.get_editable_playlists():
+            label = (
+                f"Add {len(self._selected_video_ids)} to Playlist…"
+                if has_selection
+                else "Add to Playlist…"
+            )
+            action_section.append(label, "ctx.show_add_to_playlist")
+
+            def _do_add(target_pid):
+                if not target_pid:
+                    return
+                if has_selection:
+                    vids = [
+                        t.get("videoId")
+                        for t in self._get_selected_tracks()
+                        if t.get("videoId")
+                    ]
+                else:
+                    vids = [vid] if vid else []
+                if not vids:
+                    return
+                from ui.widgets.add_to_playlist import mark_playlist_used
+                mark_playlist_used(target_pid)
+                n = len(vids)
+                # The OMV→ATV swap is handled inside add_playlist_items;
+                # it auto-enables for single-item adds (this is the
+                # right-click case) and stays off for bulk.
+                threading.Thread(
+                    target=lambda: (
+                        self.client.add_playlist_items(target_pid, vids),
+                        GLib.idle_add(
+                            self._show_toast,
+                            f"Added {n} track{'s' if n > 1 else ''} to playlist",
+                        ),
+                    ),
+                    daemon=True,
+                ).start()
+
+            def _show_popover(act, param, r=row):
+                from ui.widgets.add_to_playlist import AddToPlaylistPopover
+                pop = AddToPlaylistPopover(
+                    self.player, on_select=_do_add, parent=r
                 )
-                playlist_menu = Gio.Menu()
-                for p in sorted(playlists, key=lambda x: x.get("title", "").lower()):
-                    pid = p.get("playlistId")
-                    if pid:
-                        playlist_menu.append(
-                            p.get("title", "?"), f"ctx.add_to_playlist('{pid}')"
-                        )
-                action_section.append_submenu(label, playlist_menu)
+                pop.popup()
 
-                a_add = Gio.SimpleAction.new(
-                    "add_to_playlist", GLib.VariantType.new("s")
-                )
-
-                def _do_add(act, param):
-                    target_pid = param.get_string()
-                    if has_selection:
-                        vids = [
-                            t.get("videoId")
-                            for t in self._get_selected_tracks()
-                            if t.get("videoId")
-                        ]
-                    else:
-                        vids = [vid] if vid else []
-                    if vids:
-                        n = len(vids)
-                        threading.Thread(
-                            target=lambda: (
-                                self.client.add_playlist_items(target_pid, vids),
-                                GLib.idle_add(
-                                    self._show_toast,
-                                    f"Added {n} track{'s' if n > 1 else ''} to playlist",
-                                ),
-                            ),
-                            daemon=True,
-                        ).start()
-
-                a_add.connect("activate", _do_add)
-                group.add_action(a_add)
+            a_show = Gio.SimpleAction.new("show_add_to_playlist", None)
+            a_show.connect("activate", _show_popover)
+            group.add_action(a_show)
 
         if self.is_owned:
             if has_selection:
@@ -3385,15 +3691,12 @@ class PlaylistPage(Adw.Bin):
                             description=clean_desc or " ",
                             privacy=new_privacy,
                         )
-                        print(f"DEBUG: Metadata update success: {success}")
 
                     # 2. Update Image
                     if img_path:
-                        print(f"DEBUG: Updating playlist thumbnail with {img_path}")
                         success = self.client.set_playlist_thumbnail(
                             self.playlist_id, img_path
                         )
-                        print(f"DEBUG: Thumbnail update success: {success}")
 
                     # Refresh
                     # Clear cache and then reload
@@ -3450,8 +3753,6 @@ class PlaylistPage(Adw.Bin):
                         )
                     if normalized:
                         GObject.idle_add(self.player.extend_queue, normalized)
-                else:
-                    print("DEBUG: No new tracks found.")
             except Exception as e:
                 print(f"Error fetching remaining tracks: {e}")
 

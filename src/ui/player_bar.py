@@ -43,7 +43,7 @@ class PlayerBar(Gtk.Box):
         self.append(content_box)
 
         # Cover Art
-        from ui.utils import AsyncImage, LikeButton
+        from ui.utils import AsyncImage, LikeButton, MarqueeLabel
 
         self.cover_btn = Gtk.Button()
         self.cover_btn.add_css_class("flat")
@@ -69,11 +69,15 @@ class PlayerBar(Gtk.Box):
         meta_box.set_hexpand(True)
         meta_box.set_margin_top(0)  # Added as per instruction
 
-        self.title_label = Gtk.Label(label="Not Playing")
-        self.title_label.set_halign(Gtk.Align.START)
-        self.title_label.set_ellipsize(3)  # END
-        self.title_label.set_width_chars(1)  # Allow shrinking
+        # Marquee so long titles scroll like the expanded/mobile player
+        # instead of just getting ellipsized into "Some really long…".
+        self.title_label = MarqueeLabel()
+        self.title_label.set_label("Not Playing")
         self.title_label.add_css_class("heading")
+        # MarqueeLabel internally exposes a Gtk.Label per copy; align them to
+        # start so the title hugs the left edge before scrolling.
+        self.title_label.label1.set_halign(Gtk.Align.START)
+        self.title_label.label2.set_halign(Gtk.Align.START)
 
         self.artist_btn = Gtk.Button()
         self.artist_btn.add_css_class("flat")
@@ -197,9 +201,31 @@ class PlayerBar(Gtk.Box):
         self.like_btn.set_valign(Gtk.Align.CENTER)
         controls_box.append(self.like_btn)
 
+        # Overflow menu — when the bar narrows, like/queue/volume fold into
+        # this 3-dot button instead of disappearing outright. Hidden until
+        # _responsive_tick decides the bar's too small to show all controls
+        # inline.
+        self.overflow_btn = Gtk.MenuButton(icon_name="view-more-symbolic")
+        self.overflow_btn.set_valign(Gtk.Align.CENTER)
+        self.overflow_btn.add_css_class("flat")
+        self.overflow_btn.set_tooltip_text("More")
+        self.overflow_btn.set_visible(False)
+        self._overflow_popover = Gtk.Popover()
+        self.overflow_btn.set_popover(self._overflow_popover)
+        # Container that the responsive layout reparents controls into.
+        self._overflow_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=6
+        )
+        self._overflow_box.set_margin_top(6)
+        self._overflow_box.set_margin_bottom(6)
+        self._overflow_box.set_margin_start(6)
+        self._overflow_box.set_margin_end(6)
+        self._overflow_popover.set_child(self._overflow_box)
+        controls_box.append(self.overflow_btn)
+
         # Expand/collapse button — desktop equivalent of tapping the bar
-        # on mobile. Sits at the far right (after Like) to mirror YT
-        # Music's own chevron placement. Hidden on compact because the
+        # on mobile. Sits at the far right (after the overflow) to mirror
+        # YT Music's own chevron placement. Hidden on compact because the
         # bar itself is tappable there. Icon flips between up- and
         # down-chevron via `set_expanded`.
         self.expand_btn = Gtk.Button(icon_name="go-up-symbolic")
@@ -247,6 +273,15 @@ class PlayerBar(Gtk.Box):
         swipe.connect("swipe", self._on_swipe)
         self.content_box.add_controller(swipe)
         self._skip_cooldown = False
+
+        # Responsive control hiding for the in-between desktop widths where
+        # set_compact(True) hasn't kicked in yet but the controls are
+        # squeezing the title/artist meta box to zero. We monitor our own
+        # allocated width via a tick callback and progressively hide
+        # non-essential controls (timings, volume, queue) so the meta box
+        # always has room for at least the title.
+        self._last_responsive_width = -1
+        self.add_tick_callback(self._responsive_tick)
 
     def set_queue_active(self, active):
         if self.queue_btn.get_active() != active:
@@ -299,6 +334,50 @@ class PlayerBar(Gtk.Box):
         else:
             self.expand_btn.set_icon_name("go-up-symbolic")
             self.expand_btn.set_tooltip_text("Expand player")
+
+    def _responsive_tick(self, widget, frame_clock):
+        """Move non-essential controls (like / queue / volume) into the 3-dot
+        overflow popover as the bar narrows. Timings stay inline. Only kicks
+        in when the bar is in desktop (non-compact) mode — set_compact owns
+        the mobile layout independently."""
+        if self.is_compact:
+            return True
+        width = self.get_width()
+        if width <= 1 or width == self._last_responsive_width:
+            return True
+        self._last_responsive_width = width
+
+        # Priority of overflowing: like first, then queue, then volume.
+        # Thresholds picked so each hidden control gives ~40-60px back to
+        # the meta box. Tweak in one place if the bar's metrics change.
+        like_inline = width >= 720
+        queue_inline = width >= 640
+        volume_inline = width >= 560
+
+        self._set_control_location(self.like_btn, inline=like_inline)
+        self._set_control_location(self.queue_btn, inline=queue_inline)
+        self._set_control_location(self.volume_container, inline=volume_inline)
+
+        # The overflow button itself only appears when at least one of the
+        # three controls is hidden. It also disappears when no track is
+        # loaded (since the like_btn isn't really meaningful then anyway).
+        any_overflowed = not (like_inline and queue_inline and volume_inline)
+        self.overflow_btn.set_visible(any_overflowed)
+        return True
+
+    def _set_control_location(self, control, inline):
+        """Move `control` between the inline controls_box and the overflow
+        popover. inline=True puts it back in the bar; False relocates it
+        into the popover (so the user can still reach it via the 3-dot)."""
+        parent = control.get_parent()
+        if inline and parent is self._overflow_box:
+            self._overflow_box.remove(control)
+            # Re-insert before the overflow button so the original ordering
+            # (like → queue → volume → overflow → expand) is preserved.
+            self.controls_box.insert_child_after(control, self.next_btn)
+        elif (not inline) and parent is self.controls_box:
+            self.controls_box.remove(control)
+            self._overflow_box.append(control)
 
     def _on_artist_btn_clicked(self, btn):
         if self.on_artist_click:

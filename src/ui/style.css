@@ -197,6 +197,71 @@ listview.playlist-view > row:disabled {
   background-color: alpha(@window_bg_color, 0.4);
 }
 
+/* ── Home page ─────────────────────────────────────────────────────────── */
+
+.home-section-header {
+  margin-bottom: 2px;
+}
+
+.home-section-title {
+  font-weight: 800;
+}
+
+.home-section-icon {
+  opacity: 0.85;
+}
+
+.home-kind-icon {
+  opacity: 0.7;
+}
+
+/* Spotify-style speed-dial tile: thumbnail on the left, title on the right. */
+.home-speed-tile {
+  padding: 6px 12px 6px 6px;
+  border-radius: 8px;
+  background-color: alpha(currentColor, 0.06);
+  min-height: 64px;
+  transition: background-color 150ms ease;
+}
+
+.home-speed-tile:hover {
+  background-color: alpha(currentColor, 0.12);
+}
+
+flowboxchild:active .home-speed-tile,
+.home-speed-tile:active {
+  background-color: alpha(currentColor, 0.18);
+}
+
+flowboxchild {
+  padding: 0;
+  border-radius: 8px;
+}
+
+flowboxchild:focus {
+  outline: none;
+}
+
+.home-speed-cover {
+  border-radius: 4px;
+}
+
+.home-speed-title {
+  font-weight: 600;
+  font-size: 0.95em;
+}
+
+/* Header strapline cover (album/artist photo for "Based on X" rows). */
+.home-section-cover {
+  border-radius: 4px;
+}
+
+/* The full cover-bg-active stylesheet now lives in window.py's
+   _BLUR_OVERRIDE_CSS constant and is loaded via a CSS provider at
+   PRIORITY_USER + 1 — that way it actually overrides whatever the
+   user has in ~/.config/gtk-4.0/gtk.css instead of losing the cascade
+   to it. Don't add cover-bg rules here; they won't beat user CSS. */
+
 .queue-header .caption {
   font-weight: 700;
   text-transform: uppercase;
@@ -251,6 +316,21 @@ listview.playlist-view > row:disabled {
   background-color: @window_bg_color;
   border-left: none;
   border-right: none;
+  transition: background-color 300ms ease;
+}
+
+/* Crossfade on dark/light scheme switch — GTK doesn't animate
+   @define-color overrides on its own, so we add the transition where
+   it matters (main chrome surfaces) so cover-derived tints don't snap
+   when the system theme flips. */
+window,
+window > windowhandle,
+.player-bar,
+.queue-panel,
+.sidebar-pane,
+.card,
+.boxed-list {
+  transition: background-color 300ms ease, color 300ms ease;
 }
 
 /* Ensure queue panel within sidebar fits well */

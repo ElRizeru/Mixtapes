@@ -51,6 +51,132 @@ def robust_nav(root, items, none_if_absent=False):
 ytmusicapi.navigation.nav = robust_nav
 
 
+def _extract_shelf_title(row):
+    """Pull the heading text out of a raw home/browse shelf row, mirroring
+    ytmusicapi.parsers.browsing.parse_mixed_content so titles line up with
+    the parsed sections."""
+    if not isinstance(row, dict):
+        return None
+    if "musicDescriptionShelfRenderer" in row:
+        try:
+            return row["musicDescriptionShelfRenderer"]["header"]["runs"][0]["text"]
+        except (KeyError, IndexError, TypeError):
+            return None
+    for shelf in row.values():
+        if not isinstance(shelf, dict):
+            continue
+        try:
+            return (
+                shelf["header"]["musicCarouselShelfBasicHeaderRenderer"]
+                     ["title"]["runs"][0]["text"]
+            )
+        except (KeyError, IndexError, TypeError):
+            pass
+        try:
+            return (
+                shelf["header"]["musicImmersiveCarouselShelfBasicHeaderRenderer"]
+                     ["title"]["runs"][0]["text"]
+            )
+        except (KeyError, IndexError, TypeError):
+            pass
+    return None
+
+
+def _extract_video_types(row):
+    """Walk a raw home shelf row and return ``{videoId: musicVideoType}`` for
+    every item that exposes one.
+
+    ytmusicapi's mixed-content parser only keeps ``videoId`` for songs/videos
+    — it drops the ``musicVideoType`` flag that YouTube uses to mark a watch
+    endpoint as a song (``MUSIC_VIDEO_TYPE_ATV``) vs. a music video
+    (``OMV`` / ``UGC`` / ``OFFICIAL_SOURCE_MUSIC``). We grab it back so the
+    home page can render correct kind indicators instead of guessing.
+    """
+    out = {}
+    if not isinstance(row, dict):
+        return out
+
+    def _grab(endpoint):
+        if not isinstance(endpoint, dict):
+            return None, None
+        vid = endpoint.get("videoId")
+        mc = (
+            endpoint.get("watchEndpointMusicSupportedConfigs", {})
+                    .get("watchEndpointMusicConfig", {})
+        )
+        return vid, mc.get("musicVideoType")
+
+    def _walk_item(item):
+        if not isinstance(item, dict):
+            return
+        for renderer_key in (
+            "musicTwoRowItemRenderer",
+            "musicResponsiveListItemRenderer",
+        ):
+            renderer = item.get(renderer_key)
+            if not isinstance(renderer, dict):
+                continue
+            vid, vtype = _grab(
+                renderer.get("navigationEndpoint", {}).get("watchEndpoint")
+            )
+            if not vid:
+                # Row-style items put the watch endpoint on the play overlay.
+                vid, vtype = _grab(
+                    renderer.get("overlay", {})
+                            .get("musicItemThumbnailOverlayRenderer", {})
+                            .get("content", {})
+                            .get("musicPlayButtonRenderer", {})
+                            .get("playNavigationEndpoint", {})
+                            .get("watchEndpoint")
+                )
+            if vid and vtype:
+                out[vid] = vtype
+
+    for shelf in row.values():
+        if not isinstance(shelf, dict):
+            continue
+        for item in shelf.get("contents") or []:
+            _walk_item(item)
+    return out
+
+
+def _extract_shelf_header_meta(row):
+    """Pull per-shelf header extras (strapline thumbnail + text) out of a raw
+    home/browse row. ytmusicapi's parser drops these. Returns a dict to merge
+    into the parsed section, or None if nothing useful is present."""
+    if not isinstance(row, dict):
+        return None
+    for shelf in row.values():
+        if not isinstance(shelf, dict):
+            continue
+        header = shelf.get("header")
+        if not isinstance(header, dict):
+            continue
+        basic = (
+            header.get("musicCarouselShelfBasicHeaderRenderer")
+            or header.get("musicImmersiveCarouselShelfBasicHeaderRenderer")
+        )
+        if not isinstance(basic, dict):
+            continue
+        out = {}
+        strapline = basic.get("strapline")
+        if isinstance(strapline, dict):
+            runs = strapline.get("runs") or []
+            text = "".join(r.get("text", "") for r in runs if isinstance(r, dict))
+            if text:
+                out["strapline_text"] = text
+        thumb = (
+            basic.get("thumbnail", {})
+                 .get("musicThumbnailRenderer", {})
+                 .get("thumbnail", {})
+                 .get("thumbnails", [])
+        )
+        if thumb:
+            out["strapline_thumbnail"] = thumb[-1].get("url")
+        return out or None
+    return None
+
+
 class MusicClient:
     _instance = None
 
@@ -294,6 +420,131 @@ class MusicClient:
         if not self.api:
             return []
         return self.api.search(query, *args, **kwargs)
+
+    def find_audio_version(self, video_id, title=None, artists=None, *_, **__):
+        """Given a music-video (OMV/UGC/etc.) videoId, return the
+        videoId of its audio (ATV) counterpart — the album/song
+        version of the same release — or None if no counterpart exists
+        or the original is already an audio track.
+
+        Two-step lookup:
+
+        1. `get_watch_playlist().tracks[0].counterpart` — YT Music's
+           own pairing (the data behind the "Switch to song version"
+           button). Authoritative when present. We also harvest
+           title/artists from this response so callers don't need to
+           pass them, and so we use the same names YT Music uses.
+
+        2. Songs-filtered search — fallback when YT Music didn't pair
+           the song/video in its catalog (happens fairly often;
+           pairing seems to be curated per release rather than
+           automatic). Conservative match: normalized title equality
+           + artist name in result's artists.
+
+        Extra positional/keyword args are accepted and ignored so
+        legacy call sites that passed `verify=...` don't break."""
+        if not self.api or not video_id:
+            return None
+
+        cur_type = ""
+        cp_id = ""
+        cp_type = ""
+        cp_title = ""
+        try:
+            result = self.api.get_watch_playlist(videoId=video_id, limit=1)
+        except Exception as e:
+            print(f"[swap-version] get_watch_playlist({video_id}) failed: {e}")
+            result = {}
+        tracks = result.get("tracks") or []
+        if tracks:
+            cur = tracks[0]
+            cur_type = (cur.get("videoType") or "").upper()
+            # Prefer YT Music's track names over what the caller passed
+            # in — they're normalized for the catalog, which matches
+            # better against search results below.
+            if not title:
+                title = cur.get("title")
+            if not artists and cur.get("artists"):
+                artists = cur.get("artists")
+            counterpart = cur.get("counterpart")
+            if isinstance(counterpart, dict):
+                cp_id = counterpart.get("videoId") or ""
+                cp_type = (counterpart.get("videoType") or "").upper()
+                cp_title = counterpart.get("title") or "?"
+
+        print(
+            f"[swap-version] cur={video_id} type={cur_type or '?'} title={title!r}"
+            f" | counterpart={cp_id or '(none)'} type={cp_type or '?'} title={cp_title!r}"
+        )
+
+        if cur_type == "MUSIC_VIDEO_TYPE_ATV":
+            return None
+        if cp_id and cp_id != video_id:
+            return cp_id
+
+        # Fallback: songs-filtered search. Only attempt if we know
+        # the current video isn't ATV (either confirmed by
+        # get_watch_playlist or unknown — both worth trying for an
+        # OMV/UGC) and we have a title to match against.
+        if not title:
+            return None
+        if cur_type and cur_type == "MUSIC_VIDEO_TYPE_ATV":
+            return None  # shouldn't reach here but defensive
+        return self._search_audio_version(video_id, title, artists)
+
+    @staticmethod
+    def _norm_title(s):
+        """Lowercase, strip punctuation, collapse whitespace so titles
+        like "Foo (feat. Bar)" and "foo  feat bar" compare equal."""
+        import re
+        s = (s or "").lower()
+        s = re.sub(r"[^\w\s]", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    def _search_audio_version(self, video_id, title, artists):
+        artist_name = ""
+        if isinstance(artists, list) and artists:
+            first = artists[0]
+            artist_name = (
+                first.get("name", "") if isinstance(first, dict) else str(first)
+            )
+        elif isinstance(artists, str):
+            artist_name = artists
+
+        query = f"{title} {artist_name}".strip()
+        try:
+            results = self.api.search(query, filter="songs", limit=10)
+        except Exception as e:
+            print(f"[swap-version] search('{query}') failed: {e}")
+            return None
+
+        title_norm = self._norm_title(title)
+        artist_norm = self._norm_title(artist_name)
+        for r in results:
+            r_vid = r.get("videoId")
+            if not r_vid or r_vid == video_id:
+                continue
+            r_title = r.get("title")
+            if self._norm_title(r_title) != title_norm:
+                continue
+            r_artists = r.get("artists") or []
+            r_artist_names = {
+                self._norm_title(a.get("name"))
+                for a in r_artists
+                if isinstance(a, dict)
+            }
+            if artist_norm and artist_norm not in r_artist_names:
+                continue
+            print(
+                f"[swap-version] search fallback {video_id} → {r_vid}"
+                f" ({r_title!r})"
+            )
+            return r_vid
+        print(
+            f"[swap-version] no search match for {title!r} / {artist_name!r}"
+        )
+        return None
 
     def get_song(self, video_id):
         if not self.api:
@@ -1416,6 +1667,74 @@ class MusicClient:
             return {}
         return self.api.get_explore()
 
+    def get_home(self, limit=25):
+        if not self.api:
+            return []
+        try:
+            return self.api.get_home(limit=limit)
+        except Exception as e:
+            print(f"Error fetching home feed: {e}")
+            return []
+
+    def get_home_full(self, limit=25):
+        """Same as get_home, but also attaches per-shelf header metadata
+        (strapline thumbnail/text) that ytmusicapi's parser drops.
+
+        ytmusicapi only surfaces ``title`` + ``contents`` for each shelf. For
+        "Based on …" / "Because you played …" rows YouTube also returns a
+        small thumbnail of the seed (an album cover, artist photo, playlist
+        thumb) — we annotate first-page shelves with that thumbnail by title
+        so the home page can show it next to the heading.
+
+        We deliberately delegate the actual section fetch to ytmusicapi
+        (which handles continuations) and only do a single raw call for the
+        metadata sidecar, so continuation shelves still come through —
+        they just don't get a strapline thumbnail.
+        """
+        if not self.api:
+            return []
+
+        try:
+            sections = self.api.get_home(limit=limit) or []
+        except Exception as e:
+            print(f"Error fetching home feed: {e}")
+            return []
+
+        try:
+            from ytmusicapi.navigation import SINGLE_COLUMN_TAB, SECTION_LIST
+
+            response = self.api._send_request(
+                "browse", {"browseId": "FEmusic_home"}
+            )
+            cur = response
+            for step in SINGLE_COLUMN_TAB + SECTION_LIST:
+                cur = cur[step]
+
+            meta_by_title = {}
+            video_type_map = {}
+            for row in cur:
+                title = _extract_shelf_title(row)
+                if title:
+                    extras = _extract_shelf_header_meta(row)
+                    if extras and title not in meta_by_title:
+                        meta_by_title[title] = extras
+                video_type_map.update(_extract_video_types(row))
+
+            for sec in sections:
+                t = sec.get("title")
+                if t and t in meta_by_title:
+                    sec.update(meta_by_title[t])
+                for it in sec.get("contents") or []:
+                    if not isinstance(it, dict):
+                        continue
+                    vid = it.get("videoId")
+                    if vid and vid in video_type_map:
+                        it["videoType"] = video_type_map[vid]
+        except Exception as e:
+            print(f"[HOME] strapline metadata pass failed: {e}")
+
+        return sections
+
     def get_mood_playlists(self, params):
         if not self.api:
             return []
@@ -1755,9 +2074,32 @@ class MusicClient:
             print(f"Error deleting playlist: {e}")
             return False
 
-    def add_playlist_items(self, playlist_id, video_ids, duplicates=False):
+    def add_playlist_items(
+        self, playlist_id, video_ids, duplicates=False, swap_to_audio=None
+    ):
+        """Add tracks to a playlist.
+
+        When `swap_to_audio` is True, each music-video videoId is
+        transparently replaced with its audio (ATV) counterpart via
+        `find_audio_version`. Default behavior (`None`): auto-enable
+        for single-item adds (right-click → Add to Playlist) and
+        disable for bulk adds (Add all to Playlist, Add queue to
+        playlist) where N extra API calls would noticeably stall the
+        action. Callers can override either way explicitly."""
         if not self.is_authenticated():
             return False
+        if swap_to_audio is None:
+            swap_to_audio = len(video_ids) == 1
+        if swap_to_audio and video_ids:
+            swapped = []
+            for vid in video_ids:
+                try:
+                    alt = self.find_audio_version(vid)
+                except Exception as e:
+                    print(f"[swap-version] auto-swap failed for {vid}: {e}")
+                    alt = None
+                swapped.append(alt or vid)
+            video_ids = swapped
         try:
             self.api.add_playlist_items(playlist_id, video_ids, duplicates=duplicates)
             return True
@@ -1892,8 +2234,6 @@ class MusicClient:
             with open(image_path, "rb") as f:
                 img_data = f.read()
 
-            print(f"DEBUG: Uploading thumbnail for {playlist_id}")
-
             # Use base ytmusicapi headers, but remove Content-Type for binary upload steps
             base_headers = self.api.headers.copy()
             base_headers.pop("Content-Type", None)
@@ -1917,10 +2257,6 @@ class MusicClient:
                 headers=headers_start,
                 data=b"",
             )
-
-            print(f"DEBUG STEP1: status={init_res.status_code}")
-            print(f"DEBUG STEP1: response headers={dict(init_res.headers)}")
-            print(f"DEBUG STEP1: body={init_res.text[:500]}")
 
             upload_id = init_res.headers.get("x-guploader-uploadid")
 
@@ -1957,9 +2293,6 @@ class MusicClient:
             with urllib.request.urlopen(req) as resp:
                 upload_body = resp.read().decode("utf-8")
                 upload_status = resp.status
-
-            print(f"DEBUG STEP2: status={upload_status}")
-            print(f"DEBUG STEP2: body={upload_body[:500]}")
 
             if not upload_body.strip():
                 raise Exception(

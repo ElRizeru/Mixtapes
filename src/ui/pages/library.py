@@ -3,6 +3,7 @@ import json as _json
 from gi.repository import Gtk, Adw, GObject, GLib, Gdk, Gio, Pango
 import threading
 from api.client import MusicClient
+from ui.utils import show_toast
 
 
 LIBRARY_VIEW_MODES = ("list", "grid")
@@ -2272,9 +2273,7 @@ class UploadsPage(Gtk.Box):
         dialog.present()
 
     def _show_toast(self, message):
-        root = self.get_root()
-        if root and hasattr(root, "add_toast"):
-            root.add_toast(message)
+        show_toast(self, message)
 
     def _on_upload_clicked(self, btn):
         self._do_open_file_picker(self.get_root())

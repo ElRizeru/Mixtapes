@@ -2,7 +2,7 @@ from gi.repository import Gtk, Adw, GObject, GLib, Pango, Gdk, Gio
 import threading
 import re
 from api.client import MusicClient
-from ui.utils import AsyncImage, LikeButton, get_yt_music_link
+from ui.utils import AsyncImage, LikeButton, get_yt_music_link, show_toast
 from ui.models.song import SongItem
 from ui.widgets.song_row import SongRowWidget
 
@@ -163,6 +163,10 @@ class BasePlaylistPage(Adw.Bin):
         action_add.connect("activate", self._on_add_all_to_playlist)
         self.action_group.add_action(action_add)
 
+        action_show_add = Gio.SimpleAction.new("show_add_all_to_playlist", None)
+        action_show_add.connect("activate", self._on_show_add_all_to_playlist)
+        self.action_group.add_action(action_show_add)
+
         action_copy = Gio.SimpleAction.new("copy_link", None)
         action_copy.connect("activate", self.on_copy_link_clicked)
         self.action_group.add_action(action_copy)
@@ -261,8 +265,24 @@ class BasePlaylistPage(Adw.Bin):
         self.is_fully_fetched = False
         self._is_background_fetching = False
 
-        # Signal for current playing item
-        self.player.connect("metadata-changed", self._update_playing_indicator)
+        # Signal for current playing item. The player outlives this page, so
+        # we MUST disconnect on destroy — otherwise the bound method keeps a
+        # strong ref to self and the entire page (with its 1000-item ListStore,
+        # widget tree, track lists, etc.) leaks every time the user opens a
+        # playlist. After heavy navigation that pinned hundreds of MB.
+        self._player_metadata_handler = self.player.connect(
+            "metadata-changed", self._update_playing_indicator
+        )
+        self.connect("destroy", self._on_page_destroy)
+
+    def _on_page_destroy(self, widget):
+        hid = getattr(self, "_player_metadata_handler", None)
+        if hid is not None:
+            try:
+                self.player.disconnect(hid)
+            except Exception:
+                pass
+            self._player_metadata_handler = None
 
     def _on_factory_setup(self, factory, list_item):
         widget = SongRowWidget(self.player, self.client)
@@ -349,26 +369,36 @@ class BasePlaylistPage(Adw.Bin):
 
     def _refresh_more_menu(self):
         self.more_menu_model.remove_all()
-        # 1. Add All to Playlist Submenu
-        self.playlist_menu.remove_all()
-        playlists = self.client.get_editable_playlists()
-        for p in playlists:
-            title = p.get("title", "Untitled")
-            pid = p.get("playlistId")
-            if pid:
-                self.playlist_menu.append(title, f"page.add_all_to_playlist('{pid}')")
-
-        self.more_menu_model.append_submenu("Add all to Playlist", self.playlist_menu)
+        # 1. Add All to Playlist — opens the custom popover
+        if self.client.get_editable_playlists():
+            self.more_menu_model.append(
+                "Add all to Playlist…", "page.show_add_all_to_playlist"
+            )
 
         # 2. Copy Link (Always shown)
         self.more_menu_model.append("Copy Link", "page.copy_link")
 
     def _on_add_all_to_playlist(self, action, param):
-        playlist_id = param.get_string()
-        video_ids = [t.get("videoId") for t in self.current_tracks if t.get("videoId")]
+        self._do_add_all_to_playlist(param.get_string())
 
-        if not video_ids:
+    def _on_show_add_all_to_playlist(self, action, param):
+        from ui.widgets.add_to_playlist import AddToPlaylistPopover
+        pop = AddToPlaylistPopover(
+            self.player,
+            on_select=self._do_add_all_to_playlist,
+            parent=self.more_btn,
+        )
+        pop.popup()
+
+    def _do_add_all_to_playlist(self, playlist_id):
+        video_ids = [
+            t.get("videoId") for t in self.current_tracks if t.get("videoId")
+        ]
+        if not playlist_id or not video_ids:
             return
+
+        from ui.widgets.add_to_playlist import mark_playlist_used
+        mark_playlist_used(playlist_id)
 
         def thread_func():
             success = self.client.add_playlist_items(playlist_id, video_ids)
@@ -382,9 +412,7 @@ class BasePlaylistPage(Adw.Bin):
         threading.Thread(target=thread_func, daemon=True).start()
 
     def _show_toast(self, message):
-        root = self.get_root()
-        if hasattr(root, "add_toast"):
-            root.add_toast(message)
+        show_toast(self, message)
 
     def _on_unmap(self, widget):
         self.emit("header-title-changed", "")

@@ -4,7 +4,20 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 import threading
 from gi.repository import Gtk, Adw, GLib, Gdk, Gio, Pango
-from ui.utils import AsyncPicture, LikeButton
+from ui.utils import AsyncPicture, LikeButton, show_toast
+
+# AlbumPage is resolved lazily because ui.pages.album imports BasePlaylistPage,
+# which transitively imports this module — a top-level import would cycle.
+# Caching the class reference avoids re-importing inside every bind().
+_ALBUM_PAGE_CLS = None
+
+
+def _is_album_page(page):
+    global _ALBUM_PAGE_CLS
+    if _ALBUM_PAGE_CLS is None:
+        from ui.pages.album import AlbumPage
+        _ALBUM_PAGE_CLS = AlbumPage
+    return isinstance(page, _ALBUM_PAGE_CLS)
 
 
 class SongRowWidget(Gtk.Box):
@@ -80,11 +93,21 @@ class SongRowWidget(Gtk.Box):
         self.vbox.set_valign(Gtk.Align.CENTER)
         self.vbox.set_hexpand(True)
 
+        # Title + badges live in `title_box`. We want the badges to sit
+        # directly next to the title text, not at the far right of the row.
+        # `title_label` has hexpand=False (so it doesn't gobble all leftover
+        # space and push the badges away) but width_chars=1 + ellipsize=END
+        # so it can still shrink when the row is narrow. The trailing
+        # `_lv_title_spacer` is the element that absorbs leftover space,
+        # keeping the trio left-aligned within title_box.
         self.title_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.title_label = Gtk.Label()
         self.title_label.set_halign(Gtk.Align.START)
+        self.title_label.set_xalign(0.0)
+        self.title_label.set_hexpand(False)
         self.title_label.set_ellipsize(Pango.EllipsizeMode.END)
         self.title_label.set_lines(1)
+        self.title_label.set_width_chars(1)
 
         self.explicit_badge = Gtk.Label(label="E")
         self.explicit_badge.add_css_class("explicit-badge")
@@ -102,6 +125,12 @@ class SongRowWidget(Gtk.Box):
         self.title_box.append(self.title_label)
         self.title_box.append(self.explicit_badge)
         self.title_box.append(self.dl_icon)
+
+        # Soak up any leftover horizontal space so the title + badges stay
+        # packed at the start of the row.
+        title_spacer = Gtk.Box()
+        title_spacer.set_hexpand(True)
+        self.title_box.append(title_spacer)
 
         self.subtitle_label = Gtk.Label()
         self.subtitle_label.set_halign(Gtk.Align.START)
@@ -191,9 +220,7 @@ class SongRowWidget(Gtk.Box):
         self.explicit_badge.set_visible(item.is_explicit)
 
         # Check if this is an album view
-        from ui.pages.album import AlbumPage
-
-        is_album = isinstance(page, AlbumPage)
+        is_album = _is_album_page(page)
 
         if is_album:
             # Show track number instead of thumbnail
@@ -378,25 +405,38 @@ class SongRowWidget(Gtk.Box):
         action_goto_album.connect("activate", goto_album_action)
         group.add_action(action_goto_album)
 
-        # Add to Playlist
-        def add_to_playlist_action(action, param):
-            target_pid = param.get_string()
+        # Add to Playlist — opens a custom popover with covers + search +
+        # recents-first ordering. The Gio.Menu can't host those affordances,
+        # so the menu item just triggers the popover instead of nesting a
+        # plain text submenu.
+        def add_to_playlist(target_pid):
             target_vid = item.video_id
-            if target_pid and target_vid:
+            if not (target_pid and target_vid):
+                return
 
-                def thread_func():
-                    success = self.client.add_playlist_items(target_pid, [target_vid])
-                    if success:
-                        msg = "Added track to playlist"
-                        print(msg)
-                        GLib.idle_add(self._show_toast, msg)
-                    else:
-                        GLib.idle_add(self._show_toast, "Failed to add track")
+            from ui.widgets.add_to_playlist import mark_playlist_used
+            mark_playlist_used(target_pid)
 
-                threading.Thread(target=thread_func, daemon=True).start()
+            def thread_func():
+                # add_playlist_items handles the OMV→ATV swap itself
+                # (auto-enabled for single-item adds).
+                success = self.client.add_playlist_items(target_pid, [target_vid])
+                if success:
+                    GLib.idle_add(self._show_toast, "Added track to playlist")
+                else:
+                    GLib.idle_add(self._show_toast, "Failed to add track")
 
-        action_add = Gio.SimpleAction.new("add_to_playlist", GLib.VariantType.new("s"))
-        action_add.connect("activate", add_to_playlist_action)
+            threading.Thread(target=thread_func, daemon=True).start()
+
+        def show_add_to_playlist_action(action, param):
+            from ui.widgets.add_to_playlist import AddToPlaylistPopover
+            pop = AddToPlaylistPopover(
+                self.player, on_select=add_to_playlist, parent=self.row
+            )
+            pop.popup()
+
+        action_add = Gio.SimpleAction.new("show_add_to_playlist", None)
+        action_add.connect("activate", show_add_to_playlist_action)
         group.add_action(action_add)
 
         # Start Radio
@@ -453,15 +493,10 @@ class SongRowWidget(Gtk.Box):
         action_section = Gio.Menu()
         if item.video_id and _online:
             action_section.append("Start Radio", "row.start_radio")
-            playlists = self.client.get_editable_playlists()
-            if playlists:
-                playlist_menu = Gio.Menu()
-                for p in playlists:
-                    p_title = p.get("title", "Unknown Playlist")
-                    p_id = p.get("playlistId")
-                    if p_id:
-                        playlist_menu.append(p_title, f"row.add_to_playlist('{p_id}')")
-                action_section.append_submenu("Add to Playlist", playlist_menu)
+            if self.client.get_editable_playlists():
+                action_section.append(
+                    "Add to Playlist…", "row.show_add_to_playlist"
+                )
         # Download / Remove Download
         if item.video_id:
             root = self.get_root()
@@ -565,6 +600,4 @@ class SongRowWidget(Gtk.Box):
             popover.popup()
 
     def _show_toast(self, message):
-        root = self.get_root()
-        if hasattr(root, "add_toast"):
-            root.add_toast(message)
+        show_toast(self, message)

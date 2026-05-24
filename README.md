@@ -261,7 +261,7 @@ Without a `browser.json` file, the app falls back to the unauthenticated API, wh
 | ✅️ | **Authentication** | Connect to YouTube Music (Browser cookies) |
 | ✅️ | **Library** | ✅️ Playlists<br>✅️ Liked songs<br>✅️ Artists<br>✅️ Albums<br>✅️ Uploads |
 | ✅️ | **Search** | Search for songs, albums, and artists |
-| ☑️ | **Exploration** | ✅️ New Releases<br>✅️ Moods & Moments<br>✅️ Genres<br>✅️ Trending<br>✅️ Charts<br>🔜 Home Page |
+| ✅️ | **Exploration** | ✅️ New Releases<br>✅️ Moods & Moments<br>✅️ Genres<br>✅️ Trending<br>✅️ Charts<br>✅️ Home Page |
 | ✅️ | **Artist Page** | ✅️ Basic info<br>✅️ Related artists<br>✅️ Top tracks<br>✅️ Albums<br>✅️ Singles/EPs<br>✅️ Videos<br>✅️ Play<br>✅️ Shuffle<br>✅️ Subscribe/Unsubscribe |
 | ✅️ | **Playlist Page** | ✅️ Info<br>✅️ Tracks<br>✅️ Play<br>✅️ Shuffle<br>✅️ Order<br>✅️ Multi-Selection Editing<br>✅️ Cover Change<br>✅️ Change Visibility<br>✅️ Change Description<br>✅️ Change Name |
 | ✅️ | **Album Page** | ✅️ Basic info<br>✅️ Tracks<br>✅️ Play<br>✅️ Shuffle |
@@ -276,12 +276,12 @@ Without a `browser.json` file, the app falls back to the unauthenticated API, wh
 | ✅️ | **Background Playback** | Music keeps playing when the window is closed |
 | ✅️ | **AUR** | Available as `mixtapes-git` |
 | ☑️ | **Flatpak** | ✅️ Flatpak build<br>🔜 Flathub release<br>✅️ App icon |
-| ☑️ | **Settings** | Configure app preferences (theme, audio quality, etc.). Not much to configure yet. |
-| 🔜 | **Cover Art Tint** | Tint Libadwaita to match cover art, kinda like Material You |
+| ☑️ | **Settings** | Configure app preferences (theme, audio quality, etc.). |
+| ✅️ | **Cover Art Tint** | Tint Libadwaita to match cover art, kinda like Material You |
 | ✅️ | **Discord RPC** | Show your current track on Discord<br>✅️ Linux<br>✅️ Windows |
 | 🔜 | **Lyrics** | Synchronized lyrics, maybe using BetterLyrics API |
 | ✅️ | **Windows** | ✅️ GTK4/Libadwaita via MSYS2<br>✅️ GStreamer playback<br>✅️ SMTC media controls<br>✅️ System tray<br>✅️ Installer<br>✅️ Login helper (Edge WebView2) |
-| ❎️ | **macOS** | Unlikely that I will get hands on a Mac anytime soon, so for now won't happen. Technically it's possible to build it for macOS, but I don't have a Mac to test it on. |
+| 🔜 | **macOS** | Can build it for macOS, just need to test, there's a PR for auto-builds. |
 | 🔜 | **GNOME Circle** | Still considering it, might not happen |
 
 Have an idea or found a bug? [Open an issue!](https://github.com/m-obeid/Mixtapes/issues)

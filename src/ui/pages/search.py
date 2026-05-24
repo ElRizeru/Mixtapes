@@ -1350,23 +1350,32 @@ class SearchPage(Adw.Bin):
         action_goto.connect("activate", goto_artist_action)
         group.add_action(action_goto)
 
-        # Add to Playlist
-        def add_to_playlist_action(action, param):
-            target_pid = param.get_string()
+        # Add to Playlist via the custom popover (covers + search + recents).
+        def add_to_playlist(target_pid):
             target_vid = data.get("videoId")
-            if target_pid and target_vid:
+            if not (target_pid and target_vid):
+                return
+            from ui.widgets.add_to_playlist import mark_playlist_used
+            mark_playlist_used(target_pid)
 
-                def thread_func():
-                    success = self.client.add_playlist_items(target_pid, [target_vid])
-                    if success:
-                        print(f"Added {target_vid} to {target_pid}")
-                    else:
-                        print(f"Failed to add {target_vid} to {target_pid}")
+            def thread_func():
+                success = self.client.add_playlist_items(target_pid, [target_vid])
+                if success:
+                    print(f"Added {target_vid} to {target_pid}")
+                else:
+                    print(f"Failed to add {target_vid} to {target_pid}")
 
-                threading.Thread(target=thread_func, daemon=True).start()
+            threading.Thread(target=thread_func, daemon=True).start()
 
-        action_add = Gio.SimpleAction.new("add_to_playlist", GLib.VariantType.new("s"))
-        action_add.connect("activate", add_to_playlist_action)
+        def show_add_to_playlist_action(action, param):
+            from ui.widgets.add_to_playlist import AddToPlaylistPopover
+            pop = AddToPlaylistPopover(
+                self.player, on_select=add_to_playlist, parent=row
+            )
+            pop.popup()
+
+        action_add = Gio.SimpleAction.new("show_add_to_playlist", None)
+        action_add.connect("activate", show_add_to_playlist_action)
         group.add_action(action_add)
 
         # Start Radio
@@ -1417,16 +1426,8 @@ class SearchPage(Adw.Bin):
         # Actions
         action_section = Gio.Menu()
         action_section.append("Start Radio", "row.start_radio")
-        if "videoId" in data:
-            playlists = self.client.get_editable_playlists()
-            if playlists:
-                playlist_menu = Gio.Menu()
-                for p in playlists:
-                    p_title = p.get("title", "Unknown Playlist")
-                    p_id = p.get("playlistId")
-                    if p_id:
-                        playlist_menu.append(p_title, f"row.add_to_playlist('{p_id}')")
-                action_section.append_submenu("Add to Playlist", playlist_menu)
+        if "videoId" in data and self.client.get_editable_playlists():
+            action_section.append("Add to Playlist…", "row.show_add_to_playlist")
         menu_model.append_section(None, action_section)
 
         # Clipboard

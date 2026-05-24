@@ -381,7 +381,6 @@ class ArtistPage(Adw.Bin):
         self.artist_name = data.get("name") or "Unknown Artist"
         self.name_label.set_label(self.artist_name)
         description = data.get("description") or ""
-        print(f"DEBUG description raw: {repr(description)}")
         self._description_expanded = False
         if description:
             # Strip trailing Wikipedia attribution ("From Wikipedia, ...")
@@ -900,9 +899,6 @@ class ArtistPage(Adw.Bin):
                     section_dict = args[2]
 
         if not title or not section_dict:
-            print(
-                f"DEBUG: on_load_more_clicked could not resolve args. Received: {args}"
-            )
             return
 
         limit = self._section_limits.get(title, 10)

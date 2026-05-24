@@ -83,6 +83,29 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="2026-24-05.0" date="2026-05-24">
+      <description>
+        <p>New home feed, built-in visualizer, smarter Add to Playlist, and a wave of visual polish around blurred cover backgrounds and the dynamic accent color. And of course bug fixes.</p>
+        <ul>
+          <li>Personalized home feed with curated sections, speed-dial tiles, and direct playback from any row</li>
+          <li>New built-in spectrum visualizer (CAVA-style falling bars) above the expanded player, with bar count (up to 100) and smoothing intensity configurable in Preferences</li>
+          <li>Add to Playlist replaced with a custom popover featuring playlist covers, type-to-search, and recently-used sorting - much better for libraries with many playlists</li>
+          <li>Swap music-video tracks (OMV/UGC) to their audio (ATV) counterparts on play, downloads, and Add to Playlist - cleaner metadata and album mastering instead of music-video audio</li>
+          <li>Player bar: marquee-scrolling titles instead of ellipsis, and non-essential controls (like, queue, volume) fold into an overflow menu on mid-sized windows so the title is always visible</li>
+          <li>Material You-like color extraction from cover art for dynamic coloring throughout the UI.</li>
+          <li>Blurred background for main window using current cover art</li>
+          <li>Multi-select toolbar: Select All / Deselect All actions, with an overflow menu so the bulk-action toolbar fits comfortably on mobile widths</li>
+          <li>Track playback errors (unavailable, region-locked, removed) now show a toast with the reason and auto-advance to the next track instead of hanging</li>
+          <li>Uploaded tracks are now fully seekable - they stream from a RAM-backed temporary file instead of YouTube's broken range-request URL, and clean up on track change</li>
+          <li>Fix: opening a large playlist with many downloaded tracks no longer stalls the UI - download-status lookups now hit an in-memory cache instead of running a SQLite query per row</li>
+          <li>Fix: partial playlist fetches no longer overwrite a previously-cached full track list on disk</li>
+          <li>Fix: secondary HTTP range requests on streams now carry cookies and User-Agent so authenticated playback doesn't drop mid-song</li>
+          <li>Fix: desktop cover view now fills the full available area regardless of source thumbnail resolution - low-res video frames are upscaled like song covers instead of being centered at their tiny native size</li>
+          <li>Fix: when a YouTube thumbnail 404s and the app falls back to a lower-resolution variant, that working URL is now also propagated to Discord Rich Presence so it stops trying to load the dead maxresdefault URL</li>
+          <li>Quieter logs: removed the yt-dlp verbose flag and a wave of leftover debug prints</li>
+        </ul>
+      </description>
+    </release>
     <release version="2026-23-04.0" date="2026-04-23">
       <description>
         <p>Major feature update with UI changes, history, and more.</p>

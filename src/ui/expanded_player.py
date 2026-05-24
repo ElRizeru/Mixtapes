@@ -1,6 +1,6 @@
 import threading
 from gi.repository import Gtk, Adw, GObject, GLib, Pango, Gdk, Gio
-from ui.utils import AsyncPicture, LikeButton, MarqueeLabel
+from ui.utils import AsyncPicture, LikeButton, MarqueeLabel, show_toast
 from ui.queue_panel import QueuePanel
 
 
@@ -139,6 +139,10 @@ class ExpandedPlayer(Gtk.Box):
         a_add = Gio.SimpleAction.new("add_to_playlist", GLib.VariantType.new("s"))
         a_add.connect("activate", self._on_add_to_playlist)
         self.ep_action_group.add_action(a_add)
+
+        a_show_add = Gio.SimpleAction.new("show_add_to_playlist", None)
+        a_show_add.connect("activate", self._on_show_add_to_playlist)
+        self.ep_action_group.add_action(a_show_add)
 
         a_radio = Gio.SimpleAction.new("start_radio", None)
         a_radio.connect("activate", self._on_start_radio)
@@ -590,18 +594,9 @@ class ExpandedPlayer(Gtk.Box):
         if vid and _online:
             action_section.append("Start Radio", "ep.start_radio")
 
-        # Add to Playlist (online only)
-        if vid and _online:
-            playlists = self.player.client.get_editable_playlists()
-            if playlists:
-                playlist_menu = Gio.Menu()
-                for p in sorted(playlists, key=lambda x: x.get("title", "").lower()):
-                    pid = p.get("playlistId")
-                    if pid:
-                        playlist_menu.append(
-                            p.get("title", "?"), f"ep.add_to_playlist('{pid}')"
-                        )
-                action_section.append_submenu("Add to Playlist", playlist_menu)
+        # Add to Playlist (online only) — opens the custom popover
+        if vid and _online and self.player.client.get_editable_playlists():
+            action_section.append("Add to Playlist…", "ep.show_add_to_playlist")
 
         # Download (online only)
         if vid and _online and not self.player.download_manager.is_downloaded(vid):
@@ -621,12 +616,27 @@ class ExpandedPlayer(Gtk.Box):
             self.more_menu_model.append_section(None, clip_section)
 
     def _on_add_to_playlist(self, action, param):
-        target_pid = param.get_string()
+        self._do_add_to_playlist(param.get_string())
+
+    def _on_show_add_to_playlist(self, action, param):
+        from ui.widgets.add_to_playlist import AddToPlaylistPopover
+        pop = AddToPlaylistPopover(
+            self.player, on_select=self._do_add_to_playlist, parent=self.more_btn
+        )
+        pop.popup()
+
+    def _do_add_to_playlist(self, target_pid):
         vid = self.player.current_video_id
         if not target_pid or not vid:
             return
 
+        from ui.widgets.add_to_playlist import mark_playlist_used
+        mark_playlist_used(target_pid)
+
         def _thread():
+            # add_playlist_items auto-swaps OMV→ATV for single-item
+            # adds, so even if the player's own swap hasn't run yet,
+            # the audio version still ends up in the playlist.
             success = self.player.client.add_playlist_items(target_pid, [vid])
             msg = "Added to playlist" if success else "Failed to add"
             GLib.idle_add(self._show_toast, msg)
@@ -696,9 +706,7 @@ class ExpandedPlayer(Gtk.Box):
         threading.Thread(target=_fetch, daemon=True).start()
 
     def _show_toast(self, message):
-        root = self.get_root()
-        if root and hasattr(root, "add_toast"):
-            root.add_toast(message)
+        show_toast(self, message)
 
     # ── Carousel gesture handlers ─────────────────────────────────────────
 

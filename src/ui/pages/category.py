@@ -418,16 +418,27 @@ class CategoryPage(Adw.Bin):
                 except Exception:
                     pass
 
-        def add_to_playlist_action(action, param):
-            target_pid = param.get_string()
+        def add_to_playlist(target_pid):
             target_vid = data.get("videoId")
-            if target_pid and target_vid:
-                def thread_func():
-                    self.client.add_playlist_items(target_pid, [target_vid])
-                threading.Thread(target=thread_func, daemon=True).start()
+            if not (target_pid and target_vid):
+                return
+            from ui.widgets.add_to_playlist import mark_playlist_used
+            mark_playlist_used(target_pid)
 
-        action_add = Gio.SimpleAction.new("add_to_playlist", GLib.VariantType.new("s"))
-        action_add.connect("activate", add_to_playlist_action)
+            def thread_func():
+                self.client.add_playlist_items(target_pid, [target_vid])
+
+            threading.Thread(target=thread_func, daemon=True).start()
+
+        def show_add_to_playlist_action(action, param):
+            from ui.widgets.add_to_playlist import AddToPlaylistPopover
+            pop = AddToPlaylistPopover(
+                self.player, on_select=add_to_playlist, parent=item_box
+            )
+            pop.popup()
+
+        action_add = Gio.SimpleAction.new("show_add_to_playlist", None)
+        action_add.connect("activate", show_add_to_playlist_action)
         group.add_action(action_add)
 
         action_copy = Gio.SimpleAction.new("copy_link", None)
@@ -451,16 +462,8 @@ class CategoryPage(Adw.Bin):
             menu.append("Copy Link", "item.copy_link")
         menu.append("Copy JSON (Debug)", "item.copy_json")
 
-        if "videoId" in data:
-            playlists = self.client.get_editable_playlists()
-            if playlists:
-                playlist_menu = Gio.Menu()
-                for p in playlists:
-                    p_title = p.get("title", "Unknown")
-                    p_id = p.get("playlistId")
-                    if p_id:
-                        playlist_menu.append(p_title, f"item.add_to_playlist('{p_id}')")
-                menu.append_submenu("Add to Playlist", playlist_menu)
+        if "videoId" in data and self.client.get_editable_playlists():
+            menu.append("Add to Playlist…", "item.show_add_to_playlist")
 
         if menu.get_n_items() > 0:
             popover = Gtk.PopoverMenu.new_from_model(menu)
@@ -496,16 +499,27 @@ class CategoryPage(Adw.Bin):
                 except Exception:
                     pass
 
-        def add_to_playlist_action(action, param):
-            target_pid = param.get_string()
+        def add_to_playlist(target_pid):
             target_vid = data.get("videoId")
-            if target_pid and target_vid:
-                def thread_func():
-                    self.client.add_playlist_items(target_pid, [target_vid])
-                threading.Thread(target=thread_func, daemon=True).start()
+            if not (target_pid and target_vid):
+                return
+            from ui.widgets.add_to_playlist import mark_playlist_used
+            mark_playlist_used(target_pid)
 
-        action_add = Gio.SimpleAction.new("add_to_playlist", GLib.VariantType.new("s"))
-        action_add.connect("activate", add_to_playlist_action)
+            def thread_func():
+                self.client.add_playlist_items(target_pid, [target_vid])
+
+            threading.Thread(target=thread_func, daemon=True).start()
+
+        def show_add_to_playlist_action(action, param):
+            from ui.widgets.add_to_playlist import AddToPlaylistPopover
+            pop = AddToPlaylistPopover(
+                self.player, on_select=add_to_playlist, parent=row
+            )
+            pop.popup()
+
+        action_add = Gio.SimpleAction.new("show_add_to_playlist", None)
+        action_add.connect("activate", show_add_to_playlist_action)
         group.add_action(action_add)
 
         action_copy = Gio.SimpleAction.new("copy_link", None)
@@ -516,16 +530,8 @@ class CategoryPage(Adw.Bin):
         if url:
             menu.append("Copy Link", "row.copy_link")
 
-        if "videoId" in data:
-            playlists = self.client.get_editable_playlists()
-            if playlists:
-                playlist_menu = Gio.Menu()
-                for p in playlists:
-                    p_title = p.get("title", "Unknown")
-                    p_id = p.get("playlistId")
-                    if p_id:
-                        playlist_menu.append(p_title, f"row.add_to_playlist('{p_id}')")
-                menu.append_submenu("Add to Playlist", playlist_menu)
+        if "videoId" in data and self.client.get_editable_playlists():
+            menu.append("Add to Playlist…", "row.show_add_to_playlist")
 
         if menu.get_n_items() > 0:
             popover = Gtk.PopoverMenu.new_from_model(menu)

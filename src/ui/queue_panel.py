@@ -5,6 +5,8 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Gtk, Adw, GObject, Pango, Gdk, Gio, GLib
 
+from ui.utils import show_toast
+
 
 class QueueItem(GObject.Object):
     __gtype_name__ = "QueueItem"
@@ -221,6 +223,10 @@ class QueuePanel(Gtk.Box):
         action_add.connect("activate", self._on_add_all_to_playlist)
         self.action_group.add_action(action_add)
 
+        action_show_add = Gio.SimpleAction.new("show_add_all_to_playlist", None)
+        action_show_add.connect("activate", self._on_show_add_all_to_playlist)
+        self.action_group.add_action(action_show_add)
+
         self.more_btn = Gtk.MenuButton(icon_name="view-more-symbolic")
         self.more_btn.set_tooltip_text("More Options")
         self.more_menu_model = Gio.Menu()
@@ -258,29 +264,38 @@ class QueuePanel(Gtk.Box):
         self._update_repeat_state()
 
     def _refresh_playlists_menu(self):
-        # Rebuild from scratch — see expanded_player._refresh_more_menu for
-        # why mutating in place is not safe with GtkPopoverMenu submenus.
-        self.playlist_menu = Gio.Menu()
+        # The popover handles its own list — we just toggle whether the menu
+        # exposes the Add-to-Playlist item at all (no playlists => hide).
         self.more_menu_model = Gio.Menu()
         self.more_btn.set_menu_model(self.more_menu_model)
         from ui.utils import is_online
 
         if not is_online():
             return
-        playlists = self.player.client.get_editable_playlists()
-        for p in playlists:
-            title = p.get("title", "Untitled")
-            pid = p.get("playlistId")
-            if pid:
-                self.playlist_menu.append(title, f"queue.add_all_to_playlist('{pid}')")
-        self.more_menu_model.append_submenu("Add all to Playlist", self.playlist_menu)
+        if self.player.client.get_editable_playlists():
+            self.more_menu_model.append(
+                "Add all to Playlist…", "queue.show_add_all_to_playlist"
+            )
 
     def _on_add_all_to_playlist(self, action, param):
-        playlist_id = param.get_string()
-        video_ids = [t.get("videoId") for t in self.player.queue if t.get("videoId")]
+        self._do_add_all_to_playlist(param.get_string())
 
-        if not video_ids:
+    def _on_show_add_all_to_playlist(self, action, param):
+        from ui.widgets.add_to_playlist import AddToPlaylistPopover
+        pop = AddToPlaylistPopover(
+            self.player,
+            on_select=self._do_add_all_to_playlist,
+            parent=self.more_btn,
+        )
+        pop.popup()
+
+    def _do_add_all_to_playlist(self, playlist_id):
+        video_ids = [t.get("videoId") for t in self.player.queue if t.get("videoId")]
+        if not playlist_id or not video_ids:
             return
+
+        from ui.widgets.add_to_playlist import mark_playlist_used
+        mark_playlist_used(playlist_id)
 
         def thread_func():
             success = self.player.client.add_playlist_items(playlist_id, video_ids)
@@ -426,28 +441,26 @@ class QueuePanel(Gtk.Box):
             )
             group.add_action(a_radio)
 
-        # Add to Playlist (online only)
-        if vid and _online:
-            playlists = self.player.client.get_editable_playlists()
-            if playlists:
-                playlist_menu = Gio.Menu()
-                for pl in sorted(playlists, key=lambda x: x.get("title", "").lower()):
-                    pid = pl.get("playlistId")
-                    if pid:
-                        playlist_menu.append(
-                            pl.get("title", "?"), f"q.add_to_playlist('{pid}')"
-                        )
-                action_section.append_submenu("Add to Playlist", playlist_menu)
+        # Add to Playlist (online only) via the custom popover
+        if vid and _online and self.player.client.get_editable_playlists():
+            action_section.append("Add to Playlist…", "q.show_add_to_playlist")
 
-                a_add = Gio.SimpleAction.new(
-                    "add_to_playlist", GLib.VariantType.new("s")
+            def _show_popover(act, param, v=vid, w=widget):
+                from ui.widgets.add_to_playlist import (
+                    AddToPlaylistPopover, mark_playlist_used,
                 )
 
-                def _do_add(act, param, v=vid):
-                    target_pid = param.get_string()
+                def _on_select(target_pid):
+                    if not target_pid:
+                        return
+                    mark_playlist_used(target_pid)
 
                     def _thread():
-                        success = self.player.client.add_playlist_items(target_pid, [v])
+                        # add_playlist_items auto-swaps OMV→ATV for
+                        # single-item adds.
+                        success = self.player.client.add_playlist_items(
+                            target_pid, [v]
+                        )
                         if success:
                             GLib.idle_add(self._show_toast, "Added to playlist")
                         else:
@@ -455,8 +468,14 @@ class QueuePanel(Gtk.Box):
 
                     threading.Thread(target=_thread, daemon=True).start()
 
-                a_add.connect("activate", _do_add)
-                group.add_action(a_add)
+                pop = AddToPlaylistPopover(
+                    self.player, on_select=_on_select, parent=w
+                )
+                pop.popup()
+
+            a_show = Gio.SimpleAction.new("show_add_to_playlist", None)
+            a_show.connect("activate", _show_popover)
+            group.add_action(a_show)
 
         # Remove from Queue
         action_section.append("Remove from Queue", "q.remove")
@@ -541,9 +560,7 @@ class QueuePanel(Gtk.Box):
             GLib.idle_add(self._scroll_to_current)
 
     def _show_toast(self, message):
-        root = self.get_root()
-        if hasattr(root, "add_toast"):
-            root.add_toast(message)
+        show_toast(self, message)
 
     def _on_clear_clicked(self, btn):
         self.player.clear_queue()

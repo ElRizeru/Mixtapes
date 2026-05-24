@@ -1,28 +1,54 @@
 import os
 import threading
+import time
 import urllib.request
 import collections
 import re
 from gi.repository import Gtk, Gdk, GObject, GLib, GdkPixbuf
 
-print("DEBUG: Loading ui/utils.py v1.1 (Placeholder fix)")
+
+# is_online() result cached briefly to avoid stat+open+json.load on every
+# row bind / image fetch / right-click menu build. The result is conservative:
+# the force_offline flag rarely flips, and the NetworkMonitor query is fast on
+# its own — the disk I/O is the part that's expensive at scale.
+_IS_ONLINE_CACHE = {"value": None, "expires": 0.0}
+_IS_ONLINE_TTL = 2.0  # seconds
 
 
 def is_online():
     """Check if we have network connectivity. Respects force-offline setting."""
+    now = time.monotonic()
+    if _IS_ONLINE_CACHE["value"] is not None and now < _IS_ONLINE_CACHE["expires"]:
+        return _IS_ONLINE_CACHE["value"]
+
     import json
     prefs_path = os.path.join(GLib.get_user_data_dir(), "muse", "prefs.json")
+    force_offline = False
     try:
         if os.path.exists(prefs_path):
             with open(prefs_path) as f:
                 prefs = json.load(f)
-            if prefs.get("force_offline"):
-                return False
+            force_offline = bool(prefs.get("force_offline"))
     except Exception:
         pass
-    from gi.repository import Gio
-    monitor = Gio.NetworkMonitor.get_default()
-    return monitor.get_network_available()
+
+    if force_offline:
+        result = False
+    else:
+        from gi.repository import Gio
+        monitor = Gio.NetworkMonitor.get_default()
+        result = monitor.get_network_available()
+
+    _IS_ONLINE_CACHE["value"] = result
+    _IS_ONLINE_CACHE["expires"] = now + _IS_ONLINE_TTL
+    return result
+
+
+def invalidate_is_online_cache():
+    """Call from settings UI right after toggling force_offline so the next
+    is_online() reflects the change immediately instead of waiting for TTL."""
+    _IS_ONLINE_CACHE["value"] = None
+    _IS_ONLINE_CACHE["expires"] = 0.0
 
 # Bounded LRU Cache to prevent memory leaks (max 100 images). The cache is
 # read/written by multiple worker threads and the main thread, so every
@@ -30,8 +56,135 @@ def is_online():
 # sequences were corrupting LRU state and evicting pixbufs that other threads
 # were still wiring up into textures.
 IMG_CACHE = collections.OrderedDict()
-MAX_CACHE_SIZE = 100
+# Each cached pixbuf is up to MAX_CACHED_DIM² × 4 bytes. At the old 1600/100
+# settings the cache could pin ~1 GB by itself. The largest on-screen cover
+# is the full-window cover view, which is comfortably served by 1024 even on
+# HiDPI; song-row thumbnails are 56px. Keeping headroom for ~64 covers at
+# 1024² × 4 B ≈ 4 MB each → ~256 MB hard ceiling.
+MAX_CACHE_SIZE = 64
+MAX_CACHED_DIM = 1024
 IMG_CACHE_LOCK = threading.Lock()
+
+# Bounded executor for image fetches. Each row's `load_url` used to spawn a
+# fresh `threading.Thread`, which costs ~1-2ms apiece — when 25 rows bind at
+# once on playlist open, that's a 30-50ms stall on the UI thread *just for
+# thread creation*, before any I/O begins. The pool reuses workers and caps
+# concurrency, which also stops the flood of simultaneous network/PixbufLoader
+# work that was implicated in occasional segfaults.
+_FETCH_EXECUTOR = None
+_FETCH_EXECUTOR_LOCK = threading.Lock()
+
+# In-flight URL dedup. When a playlist has many rows sharing artwork (album
+# views, fallback chains, etc.) we used to fire N concurrent fetches for the
+# same URL. Now the first arrival owns the fetch, and later arrivals attach
+# their apply callbacks to be fired together when the pixbuf is ready.
+_INFLIGHT_FETCHES = {}
+_INFLIGHT_LOCK = threading.Lock()
+
+
+def _get_fetch_executor():
+    global _FETCH_EXECUTOR
+    if _FETCH_EXECUTOR is not None:
+        return _FETCH_EXECUTOR
+    with _FETCH_EXECUTOR_LOCK:
+        if _FETCH_EXECUTOR is None:
+            from concurrent.futures import ThreadPoolExecutor
+            # 4 workers keeps the pipeline saturated for image fetches (which
+            # release the GIL during decode + SSL) without putting so many
+            # Python-wrapper threads on the GIL that the UI thread starves
+            # waiting its turn during a heavy bind storm.
+            _FETCH_EXECUTOR = ThreadPoolExecutor(
+                max_workers=4, thread_name_prefix="muse-img"
+            )
+    return _FETCH_EXECUTOR
+
+
+def submit_fetch(fn, *args, **kwargs):
+    """Submit an image fetch onto the shared pool. Returns a Future.
+    Falls back to a raw thread if the executor can't be created (shouldn't
+    happen in practice, but keeps the UI loading even in weird envs)."""
+    try:
+        return _get_fetch_executor().submit(fn, *args, **kwargs)
+    except Exception as e:
+        print(f"[IMG] executor unavailable, falling back to thread: {e}")
+        t = threading.Thread(target=fn, args=args, kwargs=kwargs, daemon=True)
+        t.start()
+        return None
+
+# Resolved local-cover path per video_id ("file://..." or None). _get_local_cover
+# used to run mutagen + a write() on every row bind, which froze the UI when
+# opening playlists. After the first resolution we keep the answer in memory
+# so the bind path is a single dict lookup. Invalidated by the cover-extraction
+# code path itself (rare) or by app restart.
+_LOCAL_COVER_CACHE = {}
+_LOCAL_COVER_CACHE_LOCK = threading.Lock()
+
+
+def resolve_local_cover(video_id):
+    """Return a 'file://' URL for the embedded cover of a downloaded track, or
+    None if the track isn't downloaded / has no embedded art.
+
+    Fast path (the common case): O(1) dict hit, or a single stat() if the
+    extracted JPEG already exists in the cache dir. Falls back to mutagen
+    only on the very first lookup per (track, install) — and only if the
+    track is actually downloaded.
+    """
+    if not video_id:
+        return None
+    with _LOCAL_COVER_CACHE_LOCK:
+        if video_id in _LOCAL_COVER_CACHE:
+            return _LOCAL_COVER_CACHE[video_id]
+
+    # If the track isn't downloaded there's no embedded cover to extract.
+    # is_downloaded is an in-memory set lookup, so this short-circuits the
+    # mass-bind freeze for non-downloaded playlists.
+    try:
+        from player.downloads import get_download_db
+        db = get_download_db()
+    except Exception:
+        return None
+    if not db.is_downloaded(video_id):
+        with _LOCAL_COVER_CACHE_LOCK:
+            _LOCAL_COVER_CACHE[video_id] = None
+        return None
+
+    cache_dir = os.path.join(GLib.get_user_cache_dir(), "muse", "covers")
+    cover_path = os.path.join(cache_dir, f"{video_id}.jpg")
+    if os.path.exists(cover_path):
+        url = f"file://{cover_path}"
+        with _LOCAL_COVER_CACHE_LOCK:
+            _LOCAL_COVER_CACHE[video_id] = url
+        return url
+
+    # Cold path: read the audio file's tags and extract the embedded image.
+    try:
+        from player.downloads import DownloadManager
+        audio_path = db.get_local_path(video_id)
+        if audio_path:
+            cover_data = DownloadManager.extract_cover_from_file(audio_path)
+            if cover_data:
+                os.makedirs(cache_dir, exist_ok=True)
+                with open(cover_path, "wb") as f:
+                    f.write(cover_data)
+                url = f"file://{cover_path}"
+                with _LOCAL_COVER_CACHE_LOCK:
+                    _LOCAL_COVER_CACHE[video_id] = url
+                return url
+    except Exception:
+        pass
+
+    with _LOCAL_COVER_CACHE_LOCK:
+        _LOCAL_COVER_CACHE[video_id] = None
+    return None
+
+
+def invalidate_local_cover(video_id):
+    """Drop the resolved-cover cache entry for a track (e.g. after a re-download
+    or when the user removes the download)."""
+    if not video_id:
+        return
+    with _LOCAL_COVER_CACHE_LOCK:
+        _LOCAL_COVER_CACHE.pop(video_id, None)
 
 
 # ── Persistent thumbnail cache on disk ─────────────────────────────────────
@@ -89,13 +242,12 @@ def write_thumb_cache(url, data):
 def cache_pixbuf(url, pixbuf):
     if not url or not pixbuf:
         return
-    # Scale down very large images before caching to save massive amounts of RAM
-    # 1600px is more than enough for any UI element (including expanded player)
+    # Scale down very large images before caching so the cache can't pin
+    # hundreds of MB of pixbufs at full resolution.
     w = pixbuf.get_width()
     h = pixbuf.get_height()
-    max_dim = 1600
-    if w > max_dim or h > max_dim:
-        scale = max_dim / max(w, h)
+    if w > MAX_CACHED_DIM or h > MAX_CACHED_DIM:
+        scale = MAX_CACHED_DIM / max(w, h)
         pixbuf = pixbuf.scale_simple(
             int(w * scale), int(h * scale), GdkPixbuf.InterpType.BILINEAR
         )
@@ -184,6 +336,9 @@ _COVER_DL_INFLIGHT = set()
 _COVER_DL_LOCK = threading.Lock()
 
 
+_COVER_FRESHNESS_SECONDS = 24 * 60 * 60  # one day
+
+
 def save_playlist_cover_async(player, title, url):
     """Download a playlist's cover to <music_dir>/playlists/<title>.jpg so
     future opens (from anywhere — library grid, playlist page) can render
@@ -193,7 +348,9 @@ def save_playlist_cover_async(player, title, url):
     which a naked `requests.get` doesn't carry. We pass the signed-in
     client's Cookie header so those URLs resolve.
 
-    Overwrites the existing file so edits on YT propagate.
+    Re-fetches at most once per day so YT-side edits eventually propagate.
+    Library rebuilds were calling this for every tile on every navigation,
+    which produced one TLS handshake per tile and dominated the worker pool.
     """
     if not title or not url:
         return
@@ -205,6 +362,16 @@ def save_playlist_cover_async(player, title, url):
         cover_path = os.path.join(cover_dir, f"{_sanitize_filename(title)}.jpg")
     except Exception:
         return
+
+    # Freshness gate: if we already have a recent local copy, don't re-fetch.
+    # The playlist page's refresh button still triggers an unconditional
+    # reload, so users with stale art have a clear escape hatch.
+    try:
+        st = os.stat(cover_path)
+        if (time.time() - st.st_mtime) < _COVER_FRESHNESS_SECONDS:
+            return
+    except OSError:
+        pass  # missing or unreadable — proceed to download
 
     key = (title, url)
     with _COVER_DL_LOCK:
@@ -277,7 +444,22 @@ def save_playlist_cover_async(player, title, url):
             with _COVER_DL_LOCK:
                 _COVER_DL_INFLIGHT.discard(key)
 
-    threading.Thread(target=_dl, daemon=True).start()
+    # Library rebuilds invoke this once per playlist tile — 50 playlists used
+    # to mean 50 concurrent threads doing TLS handshakes, which showed up as
+    # the dominant load in py-spy and starved the main thread of the GIL.
+    # Routing through the shared pool caps concurrency at max_workers.
+    submit_fetch(_dl)
+
+
+def show_toast(widget, message):
+    """Show a toast on the nearest ancestor window that exposes
+    `add_toast` (Adw.ApplicationWindow + Adw.ToastOverlay setup).
+    Silent no-op if `widget` isn't currently parented to such a window
+    yet — happens when a deferred result comes back after the user has
+    already navigated away."""
+    root = widget.get_root() if widget else None
+    if root and hasattr(root, "add_toast"):
+        root.add_toast(message)
 
 
 def copy_to_clipboard(text):
@@ -288,7 +470,6 @@ def copy_to_clipboard(text):
     if display:
         clipboard = display.get_clipboard()
         clipboard.set(text)
-        print(f"[DEBUG] Copied to clipboard: {text}")
 
 
 def get_yt_music_link(item_id, is_album=False, audio_playlist_id=None):
@@ -417,7 +598,12 @@ class AsyncImage(Gtk.Image):
             # Rely on pixbuf scaling for explicit width/height.
             pass
 
-        self.set_from_icon_name("image-missing-symbolic")  # Placeholder
+        # Skip the placeholder icon-name lookup at init time — it's a
+        # GtkIconTheme.lookup_icon roundtrip per widget and it adds up when
+        # PlaylistPage spins up ~25 row pictures + a header cover all at
+        # once. load_url() sets the placeholder itself when it can't show
+        # a cached pixbuf, and constructions with a URL go straight to
+        # load_url anyway, never seeing the placeholder.
         self._is_placeholder = True
         self.url = url
         self.circular = circular
@@ -427,25 +613,7 @@ class AsyncImage(Gtk.Image):
 
     @staticmethod
     def _get_local_cover(video_id):
-        if not video_id:
-            return None
-        try:
-            from player.downloads import get_download_db, DownloadManager
-            db = get_download_db()
-            audio_path = db.get_local_path(video_id)
-            if audio_path:
-                cover_data = DownloadManager.extract_cover_from_file(audio_path)
-                if cover_data:
-                    cache_dir = os.path.join(GLib.get_user_cache_dir(), "muse", "covers")
-                    os.makedirs(cache_dir, exist_ok=True)
-                    cover_path = os.path.join(cache_dir, f"{video_id}.jpg")
-                    if not os.path.exists(cover_path):
-                        with open(cover_path, "wb") as f:
-                            f.write(cover_data)
-                    return f"file://{cover_path}"
-        except Exception:
-            pass
-        return None
+        return resolve_local_cover(video_id)
 
     def load_url(self, url, **kwargs):
         orig_url = url
@@ -454,8 +622,20 @@ class AsyncImage(Gtk.Image):
 
         vid = getattr(self, 'video_id', None)
 
-        # Always try local cover first for instant display
-        local = self._get_local_cover(vid) if vid else None
+        # Fast path: web URL already cached. Paint synchronously and skip the
+        # local-cover lookup entirely — keeps the bind path I/O-free.
+        cached_pixbuf = IMG_CACHE.get(url) if url else None
+        if cached_pixbuf:
+            with IMG_CACHE_LOCK:
+                if url in IMG_CACHE:
+                    IMG_CACHE.move_to_end(url)
+            self._apply_pixbuf(cached_pixbuf, url)
+            return
+
+        # No cached pixbuf — check for a downloaded copy. resolve_local_cover
+        # is O(1) after first resolution and skips entirely for non-downloaded
+        # tracks, so this no longer blocks the UI on playlist open.
+        local = resolve_local_cover(vid) if vid else None
         if local and local in IMG_CACHE:
             self.url = local
             self._apply_pixbuf(IMG_CACHE[local], local)
@@ -464,9 +644,7 @@ class AsyncImage(Gtk.Image):
                 return
         elif local:
             self.url = local
-            threading.Thread(
-                target=self._fetch_image, args=(local, [], None), daemon=True
-            ).start()
+            submit_fetch(self._fetch_image, local, [], None)
             if not is_online():
                 return
 
@@ -476,28 +654,32 @@ class AsyncImage(Gtk.Image):
             self.set_from_icon_name("image-missing-symbolic")
             return
 
-        cached_pixbuf = IMG_CACHE.get(url)
-        if cached_pixbuf:
-            IMG_CACHE.move_to_end(url)
-        else:
-            # Only show placeholder if we don't already have a valid image
-            # and no local cover is loading
-            if not local and (not self.get_paintable() or self._is_placeholder):
-                self.set_from_icon_name("image-missing-symbolic")
-                self._is_placeholder = True
+        # Only show placeholder if we don't already have a valid image
+        # and no local cover is loading
+        if not local and (not self.get_paintable() or self._is_placeholder):
+            self.set_from_icon_name("image-missing-symbolic")
+            self._is_placeholder = True
 
         fallbacks = kwargs.get("fallbacks") or get_ytimg_fallbacks(url)
         if url != orig_url and orig_url not in fallbacks:
             fallbacks.append(orig_url)
 
         self.url = url  # Update so _apply_pixbuf accepts the web result
-        thread = threading.Thread(
-            target=self._fetch_image, args=(url, fallbacks, cached_pixbuf)
-        )
-        thread.daemon = True
-        thread.start()
+        submit_fetch(self._fetch_image, url, fallbacks, None)
 
     def _fetch_image(self, url, fallbacks=None, cached_pixbuf=None):
+        # Skip stale work: if the widget has moved on (fast scroll, re-bind to
+        # a different track), don't spend cycles fetching/decoding for it.
+        if self.url != url:
+            return
+        # Another submission for the same URL may have already populated the
+        # cache by the time this task is picked up — short-circuit to apply.
+        if not cached_pixbuf:
+            cached_pixbuf = IMG_CACHE.get(url)
+            if cached_pixbuf:
+                with IMG_CACHE_LOCK:
+                    if url in IMG_CACHE:
+                        IMG_CACHE.move_to_end(url)
         try:
             pixbuf = cached_pixbuf
             if not pixbuf:
@@ -536,13 +718,10 @@ class AsyncImage(Gtk.Image):
                 pixbuf = loader.get_pixbuf()
 
                 if pixbuf:
-                    # Cache the original full-res (scaled to max 1600) pixbuf
-                    # We increase max_dim here to 1600 for better header quality
                     w = pixbuf.get_width()
                     h = pixbuf.get_height()
-                    max_dim = 1600
-                    if w > max_dim or h > max_dim:
-                        scale = max_dim / max(w, h)
+                    if w > MAX_CACHED_DIM or h > MAX_CACHED_DIM:
+                        scale = MAX_CACHED_DIM / max(w, h)
                         pixbuf = pixbuf.scale_simple(
                             int(w * scale),
                             int(h * scale),
@@ -612,6 +791,23 @@ class AsyncImage(Gtk.Image):
             # We'll rely on the player to handle the update logic.
             GLib.idle_add(self._sync_player_url, url)
 
+        # Center-crop to a square aspect ratio when the source is wider than
+        # tall (or taller than wide). Required because IMG_CACHE stores the
+        # full-aspect pixbuf — without this, cache-hit re-displays of
+        # rectangular covers (some YT thumbnails) show up letterboxed in
+        # cover slots (player bar, library tiles) that expect a square.
+        if pixbuf:
+            w = pixbuf.get_width()
+            h = pixbuf.get_height()
+            if w != h:
+                size = min(w, h)
+                x_off = (w - size) // 2
+                y_off = (h - size) // 2
+                try:
+                    pixbuf = pixbuf.new_subpixbuf(x_off, y_off, size, size)
+                except Exception:
+                    pass
+
         texture = Gdk.Texture.new_for_pixbuf(pixbuf)
         self.set_from_paintable(texture)
         self._is_placeholder = False
@@ -680,7 +876,10 @@ class AsyncPicture(Gtk.Picture):
         if icon_name:
             self.set_from_icon_name(icon_name)
         else:
-            self.set_from_icon_name("image-missing-symbolic")
+            # Skip the eager placeholder icon-name lookup; the bind path
+            # calls load_url which sets it on miss. ~25 row Pictures × 1
+            # icon-theme roundtrip apiece used to fire on every cold
+            # playlist render.
             self._is_placeholder = True
             if url:
                 self.load_url(url)
@@ -698,27 +897,7 @@ class AsyncPicture(Gtk.Picture):
         return minimum, natural, -1, -1
 
     def _get_local_cover(self):
-        """Extract cover from downloaded audio file for offline display."""
-        if not self.video_id:
-            return None
-        try:
-            from player.downloads import get_download_db, DownloadManager
-            db = get_download_db()
-            audio_path = db.get_local_path(self.video_id)
-            if audio_path:
-                cover_data = DownloadManager.extract_cover_from_file(audio_path)
-                if cover_data:
-                    # Save to a temp file for GStreamer/GTK to load
-                    cache_dir = os.path.join(GLib.get_user_cache_dir(), "muse", "covers")
-                    os.makedirs(cache_dir, exist_ok=True)
-                    cover_path = os.path.join(cache_dir, f"{self.video_id}.jpg")
-                    if not os.path.exists(cover_path):
-                        with open(cover_path, "wb") as f:
-                            f.write(cover_data)
-                    return f"file://{cover_path}"
-        except Exception:
-            pass
-        return None
+        return resolve_local_cover(self.video_id)
 
     def set_compact(self, compact):
         """Switch between desktop and mobile sizing."""
@@ -754,8 +933,20 @@ class AsyncPicture(Gtk.Picture):
         target_size = self.target_size
         crop = self.crop_to_square
 
-        # Always try local cover first for instant display
-        local = self._get_local_cover() if self.video_id else None
+        # Fast path: web URL already cached. Paint synchronously and skip the
+        # local-cover lookup entirely — keeps the bind path I/O-free.
+        if url and url in IMG_CACHE:
+            pixbuf = IMG_CACHE[url]
+            with IMG_CACHE_LOCK:
+                if url in IMG_CACHE:
+                    IMG_CACHE.move_to_end(url)
+            self._apply_pixbuf(pixbuf, url)
+            return
+
+        # No cached pixbuf — check for a downloaded copy. resolve_local_cover
+        # is O(1) after first resolution and skips entirely for non-downloaded
+        # tracks, so this no longer blocks the UI on playlist open.
+        local = resolve_local_cover(self.video_id) if self.video_id else None
         if local and local in IMG_CACHE:
             self.url = local
             self._apply_pixbuf(IMG_CACHE[local], local)
@@ -764,10 +955,7 @@ class AsyncPicture(Gtk.Picture):
                 return
         elif local:
             self.url = local
-            threading.Thread(
-                target=self._fetch_image, args=(local, target_size, crop, []),
-                daemon=True,
-            ).start()
+            submit_fetch(self._fetch_image, local, target_size, crop, [])
             if not is_online():
                 return
 
@@ -775,12 +963,6 @@ class AsyncPicture(Gtk.Picture):
             if local:
                 return  # local cover thread already started
             self.set_paintable(None)
-            return
-
-        # Check cache
-        if url in IMG_CACHE:
-            pixbuf = IMG_CACHE[url]
-            GLib.idle_add(self._apply_pixbuf, pixbuf, url)
             return
 
         # Only show placeholder if no local cover is loading
@@ -793,13 +975,22 @@ class AsyncPicture(Gtk.Picture):
             fallbacks.append(orig_url)
 
         self.url = url  # Update so _apply_pixbuf accepts the web result
-        threading.Thread(
-            target=self._fetch_image,
-            args=(url, target_size, crop, fallbacks),
-            daemon=True,
-        ).start()
+        submit_fetch(self._fetch_image, url, target_size, crop, fallbacks)
 
     def _fetch_image(self, url, target_size=None, crop=False, fallbacks=None):
+        # Skip stale work: if the widget has moved on (fast scroll, re-bind to
+        # a different track), don't spend cycles fetching/decoding for it.
+        if self.url != url:
+            return
+        # Another submission for the same URL may have already populated the
+        # cache by the time this task is picked up — short-circuit to apply.
+        cached_pixbuf = IMG_CACHE.get(url)
+        if cached_pixbuf:
+            with IMG_CACHE_LOCK:
+                if url in IMG_CACHE:
+                    IMG_CACHE.move_to_end(url)
+            GLib.idle_add(self._apply_pixbuf, cached_pixbuf, url)
+            return
         try:
             if url.startswith("file://"):
                 # Local file
@@ -839,10 +1030,8 @@ class AsyncPicture(Gtk.Picture):
                 w = pixbuf.get_width()
                 h = pixbuf.get_height()
 
-                # Scale to max_dim=1600 for high-quality caching
-                max_dim = 1600
-                if w > max_dim or h > max_dim:
-                    scale = max_dim / max(w, h)
+                if w > MAX_CACHED_DIM or h > MAX_CACHED_DIM:
+                    scale = MAX_CACHED_DIM / max(w, h)
                     pixbuf = pixbuf.scale_simple(
                         int(w * scale),
                         int(h * scale),
