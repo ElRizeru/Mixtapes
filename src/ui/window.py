@@ -43,9 +43,10 @@ window.cover-bg-active overlaysplitview,
 window.cover-bg-active overlaysplitview > box,
 window.cover-bg-active overlaysplitview > .background:not(.sidebar-pane),
 window.cover-bg-active overlaysplitview > .content-pane,
-window.cover-bg-active navigationview,
-window.cover-bg-active navigationview > .background,
-window.cover-bg-active navigationpage,
+window.cover-bg-active navigation-view,
+window.cover-bg-active navigation-view > .background,
+window.cover-bg-active navigation-view-page,
+window.cover-bg-active clamp,
 window.cover-bg-active scrolledwindow,
 window.cover-bg-active scrolledwindow > viewport,
 window.cover-bg-active stack,
@@ -153,14 +154,19 @@ window.cover-bg-active popover .card {
   background-color: @card_bg_color;
 }
 
-/* Artist banner-scrim fades into translucent so it doesn't draw an
-   opaque band beneath the artist photo. */
+/* Artist banner-scrim in blur mode: darken behind the artist name +
+   play button (around 60-75% down the banner) so text stays
+   readable, but fade BACK to transparent at the very bottom — the
+   FadeBottomBin already masks the image to alpha 0 there, and a
+   scrim that's still translucent at that point would re-introduce
+   the "colored band" the mask was designed to eliminate. */
 window.cover-bg-active .banner-scrim {
   background: linear-gradient(
     to bottom,
     transparent 0%,
-    alpha(@window_bg_color, 0.18) 50%,
-    alpha(@window_bg_color, 0.4) 100%
+    alpha(@window_bg_color, 0.25) 55%,
+    alpha(@window_bg_color, 0.45) 75%,
+    transparent 100%
   );
 }
 
@@ -655,6 +661,7 @@ class MainWindow(Adw.ApplicationWindow):
         becomes translucent immediately instead of waiting for the PIL
         blur thread to finish. The bg image is added on top when ready."""
         self.add_css_class("cover-bg-active")
+        print("[BLUR] activated cover-bg-active class")
         # Load the override stylesheet by itself if the provider is empty.
         # _update_blurred_background's callback will re-load with the
         # background-image rule appended once the PNG is ready.

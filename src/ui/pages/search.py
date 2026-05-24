@@ -1,7 +1,7 @@
 from gi.repository import Gtk, Adw, GObject, GLib, Pango, Gio, Gdk
 import threading
 from api.client import MusicClient
-from ui.utils import AsyncPicture, LikeButton, parse_item_metadata
+from ui.utils import AsyncPicture, LikeButton, parse_item_metadata, attach_playing_highlight
 
 
 class SearchPage(Adw.Bin):
@@ -678,6 +678,11 @@ class SearchPage(Adw.Bin):
             box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
             box.add_css_class("song-row")
             row.set_child(box)
+            # Highlight the row while its track is playing — Explore
+            # rows don't use SongRowWidget so they need an explicit
+            # subscription.
+            if item.get("videoId"):
+                attach_playing_highlight(box, self.player, item["videoId"])
 
             # Subtitle
             subtitle = ""

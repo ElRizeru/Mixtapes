@@ -82,6 +82,38 @@ class ExpandedPlayer(Gtk.Box):
         cover_frame.add_controller(cover_click)
 
         self._ignore_page_change = False
+        # The carousel emits notify::position both for user swipes AND for
+        # layout settles after we programmatically scroll_to a new page.
+        # The two are indistinguishable from the signal alone, so the
+        # `_ignore_page_change` window can race with a late settle event
+        # and cause `_do_jump(0)` to fire — snapping playback back to the
+        # first track right after the user clicked a different one. To
+        # reject those late settles, we only act on position-changed when
+        # we've seen a real user gesture (drag or click) on the carousel
+        # within the recent past.
+        import time as _time
+        self._carousel_user_input_at = 0.0
+        self._carousel_user_input_window = 0.8  # seconds
+        self._time = _time
+        drag = Gtk.GestureDrag()
+        drag.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        drag.connect("drag-begin", self._on_carousel_user_input)
+        self.carousel.add_controller(drag)
+        click = Gtk.GestureClick()
+        click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        click.connect("pressed", self._on_carousel_user_input)
+        self.carousel.add_controller(click)
+        # Trackpad / mouse wheel swipes don't fire the gesture
+        # controllers above — they go through EventControllerScroll
+        # (which Adw.Carousel uses internally to scroll its pages).
+        # Listen on CAPTURE so we stamp the user-input timestamp before
+        # the carousel consumes the event.
+        scroll = Gtk.EventControllerScroll.new(
+            Gtk.EventControllerScrollFlags.BOTH_AXES
+        )
+        scroll.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        scroll.connect("scroll", self._on_carousel_user_input)
+        self.carousel.add_controller(scroll)
         self.carousel.connect("notify::position", self._on_carousel_position_changed)
         self.connect("map", self._on_map)
 
@@ -710,6 +742,13 @@ class ExpandedPlayer(Gtk.Box):
 
     # ── Carousel gesture handlers ─────────────────────────────────────────
 
+    def _on_carousel_user_input(self, *_):
+        """Stamp the timestamp of the last real user interaction with
+        the carousel (drag or click). `_do_jump` requires a recent
+        stamp to act, so layout-driven `notify::position` settles can
+        no longer be misinterpreted as user swipes."""
+        self._carousel_user_input_at = self._time.monotonic()
+
     def _on_carousel_position_changed(self, carousel, param):
         if getattr(self, "_ignore_page_change", False):
             return
@@ -738,15 +777,25 @@ class ExpandedPlayer(Gtk.Box):
             if 0 <= new_idx < len(self.player.queue):
 
                 def _do_jump(jump_idx):
+                    cur = self.player.current_queue_index
+                    # Require a real user gesture on the carousel (drag
+                    # or click) within the recent window. Programmatic
+                    # settles after queue rebuilds don't update this
+                    # stamp, so spurious position emits — including the
+                    # one that used to snap playback back to track 0
+                    # after the user clicked a different track in the
+                    # home feed — get rejected here.
+                    since_input = (
+                        self._time.monotonic() - self._carousel_user_input_at
+                    )
+                    if since_input > self._carousel_user_input_window:
+                        self._ignore_page_change = False
+                        return False
                     # Guard: don't override if the player is already loading a different track
-                    # (e.g. carousel settling after a programmatic queue change)
                     if self.player._is_loading:
                         self._ignore_page_change = False
                         return False
                     # Real user swipes only ever move one page at a time.
-                    # Anything larger means the carousel is settling after a
-                    # programmatic queue resize and we should not act on it.
-                    cur = self.player.current_queue_index
                     if cur >= 0 and abs(jump_idx - cur) > 1:
                         self._ignore_page_change = False
                         return False

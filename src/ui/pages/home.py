@@ -4,7 +4,10 @@ import threading
 from gi.repository import Gtk, Adw, GObject, GLib, Pango, Gdk, Gio
 
 from api.client import MusicClient
-from ui.utils import AsyncImage, AsyncPicture, parse_item_metadata, is_online
+from ui.utils import (
+    AsyncImage, AsyncPicture, parse_item_metadata, is_online,
+    attach_playing_highlight,
+)
 from ui.widgets.scroll_box import HorizontalScrollBox
 
 
@@ -368,9 +371,42 @@ class HomePage(Adw.Bin):
         if compact:
             self.add_css_class("compact")
             self.feed_box.set_spacing(20)
+            # Pull in page margins so two 160 px cards fit side by
+            # side at 360 px (the mobile breakpoint floor) without the
+            # second one getting clipped.
+            self.feed_box.set_margin_start(6)
+            self.feed_box.set_margin_end(6)
         else:
             self.remove_css_class("compact")
             self.feed_box.set_spacing(28)
+            self.feed_box.set_margin_start(12)
+            self.feed_box.set_margin_end(12)
+        # Tighten the gap between cards in each horizontal strip
+        # (16 → 8 px in compact). The CSS `.compact .artist-horizontal-item`
+        # rule also halves the per-card hover padding, both contribute
+        # to keeping two cards visible on a 360 px viewport.
+        for strip in getattr(self, "_card_strips", []):
+            strip.set_spacing(8 if compact else 16)
+        # Walk the already-built feed and shrink each AsyncPicture
+        # thumbnail (56 → 44 px) to match Explore's compact behavior.
+        # Without this, the song-list rows in Quick Picks / Listen
+        # Again / etc. stay at their desktop size on mobile widths.
+        self._propagate_compact(self.feed_box, compact)
+
+    def _propagate_compact(self, widget, compact):
+        """Recursively set compact mode on any descendant that exposes
+        set_compact — covers both AsyncPicture (song rows) and
+        AsyncImage (speed-dial tiles), so the quick-dial covers also
+        shrink to leave more room for text on mobile widths."""
+        if hasattr(widget, "set_compact"):
+            try:
+                widget.set_compact(compact)
+            except Exception:
+                pass
+        child = widget.get_first_child() if hasattr(widget, "get_first_child") else None
+        while child:
+            self._propagate_compact(child, compact)
+            child = child.get_next_sibling()
 
     # ─── Fetch ─────────────────────────────────────────────────────────────
 
@@ -639,7 +675,14 @@ class HomePage(Adw.Bin):
         title_label.add_css_class("home-speed-title")
         text_col.append(title_label)
 
-        text_col.append(self._build_kind_subtitle(item, kind, dim=True))
+        # Speed tile: icon yes, kind word no — saves a chunk of width
+        # ("Song · ", "Video · " etc. ate ~6-8 chars otherwise) so the
+        # title + artist read better, especially in compact mode.
+        text_col.append(
+            self._build_kind_subtitle(
+                item, kind, dim=True, include_kind=True, include_kind_word=False
+            )
+        )
         tile.append(text_col)
 
         right = Gtk.GestureClick()
@@ -701,6 +744,10 @@ class HomePage(Adw.Bin):
             box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
             box.add_css_class("song-row")
             row.set_child(box)
+            # Light up the row while this track is the one playing —
+            # home rows are built ad-hoc (not SongRowWidget), so they
+            # need an explicit subscription to player metadata.
+            attach_playing_highlight(box, self.player, item.get("videoId"))
 
             thumb_url = (
                 (item.get("thumbnails") or [{}])[-1].get("url")
@@ -753,6 +800,12 @@ class HomePage(Adw.Bin):
         scroll_box = HorizontalScrollBox()
         h_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
         h_box.set_margin_bottom(8)
+        # Track strips so set_compact_mode can tighten their gaps on
+        # mobile widths (default 16 px → 8 px in compact).
+        if not hasattr(self, "_card_strips"):
+            self._card_strips = []
+        self._card_strips.append(h_box)
+        h_box.set_spacing(8 if getattr(self, "_compact", False) else 16)
 
         for item in items:
             kind = _detect_kind(item, section_title)
@@ -826,9 +879,19 @@ class HomePage(Adw.Bin):
 
     # ─── Subtitle row with kind icon + detail ──────────────────────────────
 
-    def _build_kind_subtitle(self, item, kind, dim=True, include_kind=True):
+    def _build_kind_subtitle(
+        self, item, kind, dim=True, include_kind=True, include_kind_word=None
+    ):
         """Compact row: [kind-icon] [Kind label · detail], with optional
-        explicit badge inline. Used by both cards and song rows."""
+        explicit badge inline. Used by both cards and song rows.
+
+        `include_kind` controls the icon. `include_kind_word` controls
+        whether the kind name ("Song", "Video", "Album") is repeated
+        in the text — useful for speed-dial tiles where the icon
+        already conveys kind and the redundant word eats text room.
+        Defaults to `include_kind` for backward compatibility."""
+        if include_kind_word is None:
+            include_kind_word = include_kind
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         row.set_halign(Gtk.Align.START)
 
@@ -849,7 +912,7 @@ class HomePage(Adw.Bin):
             row.append(explicit_lbl)
 
         parts = []
-        if include_kind:
+        if include_kind_word:
             kw = _kind_word(kind, item)
             if kw:
                 parts.append(kw)

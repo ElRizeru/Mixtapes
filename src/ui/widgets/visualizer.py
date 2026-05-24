@@ -125,6 +125,7 @@ class Visualizer(Gtk.DrawingArea):
         self._data_handler = self.player.connect(
             "visualizer-data", self._on_data
         )
+        print("[VIZ-WIDGET] realized, subscribed to visualizer-data signal")
 
     def _on_unrealize(self, *_):
         if hasattr(self, "_data_handler"):
@@ -225,6 +226,13 @@ class Visualizer(Gtk.DrawingArea):
     # ─── Data → snap up ────────────────────────────────────────────────────
 
     def _on_data(self, _player, magnitudes):
+        if not getattr(self, "_viz_first_data_logged", False):
+            self._viz_first_data_logged = True
+            print(
+                f"[VIZ-WIDGET] first data callback fired "
+                f"(magnitudes={len(magnitudes) if magnitudes else 0}, "
+                f"visible={self.get_visible()}, mapped={self.get_mapped()})"
+            )
         if not magnitudes:
             return
         bars = self._reduce(magnitudes)

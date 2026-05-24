@@ -3,7 +3,10 @@ import threading
 import json
 import re
 from api.client import MusicClient
-from ui.utils import AsyncImage, AsyncPicture, LikeButton, parse_item_metadata
+from ui.utils import (
+    AsyncImage, AsyncPicture, LikeButton, parse_item_metadata,
+    attach_playing_highlight,
+)
 
 
 class ArtistPage(Adw.Bin):
@@ -71,7 +74,8 @@ class ArtistPage(Adw.Bin):
         self.avatar.set_valign(Gtk.Align.FILL)
         self.avatar.set_content_fit(Gtk.ContentFit.COVER)
 
-        self.banner_wrapper = Gtk.Box()
+        from ui.widgets.fade_bottom_bin import FadeBottomBin
+        self.banner_wrapper = FadeBottomBin(fade_start=0.55)
         self.banner_wrapper.set_overflow(Gtk.Overflow.HIDDEN)
         self.banner_wrapper.add_css_class("banner-top-rounded")
         self.banner_wrapper.set_hexpand(True)
@@ -79,6 +83,38 @@ class ArtistPage(Adw.Bin):
         self.banner_wrapper.set_size_request(-1, 260)
         self.banner_wrapper.append(self.avatar)
         self.banner_overlay.set_child(self.banner_wrapper)
+        # Sync the bottom fade with the window's blur mode. Without the
+        # fade in non-blur mode, the existing `.banner-scrim` gradient
+        # ramping to opaque @window_bg_color already hides the bottom
+        # edge of the photo. In blur mode that scrim can't go fully
+        # opaque (would paint a solid band over the blur), so we mask
+        # the image itself to alpha 0 instead. Re-check on every realize
+        # plus on a notify::css-classes from the root window.
+        def _sync_banner_fade(*_):
+            root = self.banner_wrapper.get_root()
+            classes = list(root.get_css_classes()) if root else []
+            active = "cover-bg-active" in classes
+            print(
+                f"[FADE-SYNC] root={type(root).__name__ if root else None}"
+                f" classes={classes} active={active}"
+            )
+            self.banner_wrapper.set_fade_active(active)
+
+        self._sync_banner_fade = _sync_banner_fade
+        self._banner_fade_root_handler = None
+
+        def _hook_root(*_):
+            root = self.banner_wrapper.get_root()
+            if root and self._banner_fade_root_handler is None:
+                self._banner_fade_root_handler = root.connect(
+                    "notify::css-classes", _sync_banner_fade
+                )
+            _sync_banner_fade()
+
+        self.banner_wrapper.connect("realize", _hook_root)
+        self.banner_wrapper.connect(
+            "map", lambda *_: GLib.idle_add(_hook_root)
+        )
 
         # Visual Scrim
         self.banner_scrim = Gtk.Box()
@@ -535,6 +571,11 @@ class ArtistPage(Adw.Bin):
             box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
             box.add_css_class("song-row")
             row.set_child(box)
+            # Highlight while this track is playing — artist's Top
+            # Songs rows are built ad-hoc (not SongRowWidget) so they
+            # need an explicit subscription.
+            if item.get("videoId"):
+                attach_playing_highlight(box, self.player, item["videoId"])
 
             # Thumbnail
             thumbnails = item.get("thumbnails", [])

@@ -126,6 +126,20 @@ box.song-row.playing label {
   color: @playing_fg;
 }
 
+/* Boxed-list rows have libadwaita's opaque row bg which masks the
+   inner `box.song-row.playing` color. We mirror the .playing class
+   onto the surrounding `row` and tint that directly.
+
+   Note: GtkListBox's CSS node name is `list` (NOT `listbox`), and
+   GtkListBoxRow's is `row` (NOT `listboxrow`) — the obvious-looking
+   selectors silently match nothing. */
+list row.playing {
+  background-color: alpha(@accent_color, 0.18);
+}
+list row.playing label {
+  color: @playing_fg;
+}
+
 /* Reset color for context menu popovers so they don't inherit playing color */
 box.song-row.playing popover label,
 box.song-row.playing popover modelbutton,
@@ -165,6 +179,12 @@ listview.playlist-view > row:disabled {
   padding: 8px;
   border-radius: 12px;
   transition: background-color 200ms ease;
+}
+
+/* Compact (mobile) reduces per-card hover padding so two 160 px cards
+   still fit side by side at 360 px page width without clipping. */
+.compact .artist-horizontal-item {
+  padding: 4px;
 }
 
 .artist-horizontal-item:hover {
@@ -222,6 +242,15 @@ listview.playlist-view > row:disabled {
   background-color: alpha(currentColor, 0.06);
   min-height: 64px;
   transition: background-color 150ms ease;
+}
+
+/* In compact (mobile) layout the page surfaces more tiles per screen
+   if each one is shorter. The 44 px cover already shrinks via
+   AsyncImage.set_compact, so the row is comfortable at ~52 px tall
+   with tighter padding. */
+.compact .home-speed-tile {
+  padding: 4px 10px 4px 4px;
+  min-height: 52px;
 }
 
 .home-speed-tile:hover {

@@ -462,6 +462,55 @@ def save_playlist_cover_async(player, title, url):
     submit_fetch(_dl)
 
 
+def attach_playing_highlight(row_widget, player, video_id):
+    """Toggle a `playing` CSS class while `player`'s currently-playing
+    track matches `video_id`. Auto-disconnects on widget destroy.
+
+    Targets the enclosing Gtk.ListBoxRow when one exists (so the
+    full outer row lights up, not just the inner box — and the inner
+    `box.song-row.playing` rule doesn't fight us by double-tinting).
+    Falls back to `row_widget` itself if no ListBoxRow ancestor is
+    found.
+
+    Use for ad-hoc song rows (Home, Explore, Artist Top Songs, etc.)
+    that don't go through SongRowWidget — which already has its own
+    highlight machinery. Lightweight: one signal connection per row.
+    """
+    if not row_widget or not player or not video_id:
+        return
+
+    list_row = row_widget.get_parent()
+    while list_row is not None and not isinstance(list_row, Gtk.ListBoxRow):
+        list_row = list_row.get_parent()
+    target = list_row or row_widget
+
+    def _refresh(*_):
+        # Match either the player's current id OR the pre-swap source
+        # id — when the player auto-swaps an OMV/UGC track to its ATV
+        # counterpart, the row's stored videoId would otherwise no
+        # longer match.
+        source = getattr(player, "_current_source_video_id", None)
+        is_playing = video_id in (player.current_video_id, source)
+        if is_playing:
+            target.add_css_class("playing")
+        else:
+            target.remove_css_class("playing")
+
+    try:
+        handler = player.connect("metadata-changed", _refresh)
+    except Exception:
+        return
+
+    def _cleanup(*_):
+        try:
+            player.disconnect(handler)
+        except Exception:
+            pass
+
+    row_widget.connect("destroy", _cleanup)
+    _refresh()
+
+
 def show_toast(widget, message):
     """Show a toast on the nearest ancestor window that exposes
     `add_toast` (Adw.ApplicationWindow + Adw.ToastOverlay setup).
@@ -618,9 +667,28 @@ class AsyncImage(Gtk.Image):
         self._is_placeholder = True
         self.url = url
         self.circular = circular
+        # Remember the desktop size so set_compact() can restore it
+        # when compact mode toggles off. Mirrors AsyncPicture.target_size.
+        self._base_size = self.target_w
 
         if url:
             self.load_url(url)
+
+    def set_compact(self, compact):
+        """Switch between desktop and mobile sizing. Only applies to
+        small thumbnail-sized images (≤80 px base) — larger AsyncImages
+        like section cards (160 px) or artist banner thumbs (140 px)
+        are full-tile artwork and shouldn't shrink to 44, that would
+        ruin the visual hierarchy of the page."""
+        if self._base_size is None or self._base_size > 80:
+            return
+        new = 44 if compact else self._base_size
+        if new == self.target_w:
+            return
+        self.target_w = new
+        self.target_h = new
+        self.set_pixel_size(new)
+        self.queue_resize()
 
     @staticmethod
     def _get_local_cover(video_id):

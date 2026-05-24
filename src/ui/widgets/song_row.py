@@ -248,9 +248,16 @@ class SongRowWidget(Gtk.Box):
 
         # CSS handles responsiveness and size limits natively now
 
-        # Set initial playing state based on current player state
+        # Set initial playing state. Check both the player's current
+        # video id AND the swap-source id so the row lights up even
+        # when the player has already swapped the queued OMV track to
+        # its ATV counterpart before this bind happened.
+        _source_vid = getattr(self.player, "_current_source_video_id", None)
         self._apply_playing_state(
-            bool(item.video_id and item.video_id == self.player.current_video_id)
+            bool(item.video_id and (
+                item.video_id == self.player.current_video_id
+                or item.video_id == _source_vid
+            ))
         )
 
         # Connect directly to the player metadata signal (reliable than GObject property notify)
@@ -260,9 +267,15 @@ class SongRowWidget(Gtk.Box):
 
     def _on_player_metadata_changed(self, player, *args):
         if self.model_item:
+            vid = self.model_item.video_id
+            # Match the swap-from id too: when the player auto-swaps
+            # an OMV/UGC track to its audio (ATV) counterpart, the
+            # `current_video_id` drifts away from what an album/
+            # playlist row holds. `_current_source_video_id` is the
+            # pre-swap id, so the highlight stays on the right row.
+            source_vid = getattr(player, "_current_source_video_id", None)
             is_playing = bool(
-                self.model_item.video_id
-                and self.model_item.video_id == player.current_video_id
+                vid and (vid == player.current_video_id or vid == source_vid)
             )
             self._apply_playing_state(is_playing)
 

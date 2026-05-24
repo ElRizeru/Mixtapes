@@ -33,6 +33,60 @@ else:
 from player.discord_rpc import DiscordRPCAdapter
 
 
+def _extract_spectrum_bands(structure):
+    """Pull a list[float] of magnitudes out of a GStreamer `spectrum`
+    bus-message Structure. Returns None if no path yields data.
+
+    PyGObject's surface for GstValueList varies by version:
+      - `structure.get_list("magnitude")` returns (True, Gst.ValueArray)
+        on modern builds. The ValueArray is NOT iterable but exposes
+        `.n_values` + `.get_nth(i)`.
+      - `structure.get_value("magnitude")` may return a plain Python
+        list, a GValueArray-like with `.n_values`, or raise
+        `TypeError: unknown type GstValueList` if PyGObject doesn't
+        have a converter registered for the inner GType.
+    Try both APIs and walk whatever shape comes back.
+    """
+    def _walk(obj):
+        if obj is None:
+            return None
+        if isinstance(obj, (list, tuple)):
+            try:
+                return [float(v) for v in obj]
+            except Exception:
+                return None
+        if hasattr(obj, "n_values") and hasattr(obj, "get_nth"):
+            try:
+                out = []
+                for i in range(obj.n_values):
+                    v = obj.get_nth(i)
+                    out.append(
+                        float(v.get_float()) if hasattr(v, "get_float") else float(v)
+                    )
+                return out
+            except Exception:
+                return None
+        try:
+            return [float(v) for v in obj]
+        except Exception:
+            return None
+
+    try:
+        ok, mags = structure.get_list("magnitude")
+        if ok:
+            bands = _walk(mags)
+            if bands:
+                return bands
+    except Exception:
+        pass
+
+    try:
+        raw = structure.get_value("magnitude")
+    except Exception:
+        raw = None
+    return _walk(raw)
+
+
 def _parse_track_duration(track):
     """Return a positive duration in seconds for `track`, or 0 if unknown.
 
@@ -126,6 +180,12 @@ class Player(GObject.Object):
             spectrum.set_property("threshold", int(self._visualizer_threshold_db))
             spectrum.set_property("multi-channel", False)
             self.player.set_property("audio-filter", spectrum)
+            print("[VISUALIZER] spectrum element loaded — bars should animate")
+        else:
+            print(
+                "[VISUALIZER] spectrum element NOT available "
+                "(missing gst-plugins-good in this runtime) — bars will be inert"
+            )
 
         # Inject auth cookies + User-Agent into the HTTP source on every
         # source-setup. Helps for non-upload streams that need cookies on
@@ -419,6 +479,13 @@ class Player(GObject.Object):
         Sets the global queue and plays the track at start_index.
         tracks: list of dicts with videoId, title, artist, thumb
         """
+        import traceback as _tb
+        _caller = "".join(_tb.format_stack(limit=4)[:-1])
+        print(
+            f"[JUMP-TRACE] set_queue n={len(tracks)} start_index={start_index}"
+            f" shuffle={shuffle} source_id={source_id}\nCALLER:\n{_caller}",
+            flush=True,
+        )
         self.stop()
         self.queue = list(tracks)  # Copy for playing
         self.original_queue = list(tracks)  # Backup for un-shuffle
@@ -541,14 +608,28 @@ class Player(GObject.Object):
 
     def clear_queue(self):
         self.stop()
+        # Bump the load generation so any in-flight _fetch_and_play /
+        # yt-dlp resolution that hasn't reached _start_playback yet
+        # sees the new generation and aborts. Without this, clicking
+        # Clear while a track was loading would let the resolution
+        # finish and start playback into an empty queue.
+        self.load_generation += 1
         self.queue = []
         self.original_queue = []
         self.current_queue_index = -1
         self.current_video_id = None
+        self._current_source_video_id = None
         self.emit("state-changed", "stopped")
         self.emit("metadata-changed", "", "", "", "", "INDIFFERENT")
 
     def play_queue_index(self, index):
+        import traceback as _tb
+        _caller = "".join(_tb.format_stack(limit=4)[:-1])
+        print(
+            f"[JUMP-TRACE] play_queue_index({index}) queue_len={len(self.queue)}"
+            f" current_idx={self.current_queue_index}\nCALLER:\n{_caller}",
+            flush=True,
+        )
         if 0 <= index < len(self.queue):
             self.stop()
             self.current_queue_index = index
@@ -789,6 +870,12 @@ class Player(GObject.Object):
         self, video_id, title, artist, thumbnail_url, like_status="INDIFFERENT"
     ):
         self.current_video_id = video_id
+        # Remember the videoId we were asked to play *before* any
+        # OMV→ATV swap kicks in. Pages that show the original videoId
+        # (album/playlist track rows) compare against this so the
+        # currently-playing highlight still matches their row even
+        # after the player swaps to the audio version.
+        self._current_source_video_id = video_id
 
         self._is_loading = True
         try:
@@ -1640,45 +1727,24 @@ class Player(GObject.Object):
         and sometimes via `Gst.Structure.get_list` returning (ok, list).
         We try all three.
         """
-        bands = None
+        # Diagnostic: print once on the first dispatched message so we
+        # can tell from the terminal whether the audio→spectrum→bus
+        # path is actually producing data (vs. failing silently
+        # somewhere upstream).
+        if not getattr(self, "_visualizer_first_msg_logged", False):
+            self._visualizer_first_msg_logged = True
+            print("[VISUALIZER] first spectrum message received — data flowing")
 
-        # Path 1: get_list returns (bool, [floats]) for GstValueList fields.
-        try:
-            ok, mags = structure.get_list("magnitude")
-            if ok and mags is not None:
-                bands = [float(v) for v in mags]
-        except Exception:
-            pass
-
-        # Path 2: get_value returns either a list or a GValueArray-like.
-        if not bands:
-            try:
-                raw = structure.get_value("magnitude")
-            except Exception:
-                raw = None
-            if raw is not None:
-                if isinstance(raw, (list, tuple)):
-                    try:
-                        bands = [float(v) for v in raw]
-                    except Exception:
-                        pass
-                elif hasattr(raw, "n_values"):
-                    try:
-                        bands = []
-                        for i in range(raw.n_values):
-                            v = raw.get_nth(i)
-                            bands.append(
-                                float(v.get_float()) if hasattr(v, "get_float") else float(v)
-                            )
-                    except Exception:
-                        bands = None
-                else:
-                    # Last-ditch: it iterates.
-                    try:
-                        bands = [float(v) for v in raw]
-                    except Exception:
-                        bands = None
-
+        # PyGObject surfaces GstValueList three different ways across
+        # GStreamer/PyGObject versions, none of them iterable in the
+        # plain Python sense:
+        #   - `structure.get_list("magnitude")` → (True, Gst.ValueArray)
+        #     on modern builds. ValueArray exposes .n_values + .get_nth(i).
+        #   - `structure.get_value("magnitude")` → either a plain list, a
+        #     GValueArray-like with .n_values, or it raises
+        #     `TypeError: unknown type GstValueList` (no PyGObject
+        #     converter registered for this GType). Walk both shapes.
+        bands = _extract_spectrum_bands(structure)
         if not bands:
             return
         self.emit("visualizer-data", bands)
