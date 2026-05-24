@@ -16,7 +16,15 @@ _IS_ONLINE_TTL = 2.0  # seconds
 
 
 def is_online():
-    """Check if we have network connectivity. Respects force-offline setting."""
+    """Check if we have network connectivity. Respects force-offline setting.
+
+    Implementation: short TCP connect to `music.youtube.com:443` —
+    cheap (sub-50ms when actually online), exercises DNS + reachability
+    of the service we actually depend on, and avoids pinging an
+    unrelated third party. Far more reliable than `Gio.NetworkMonitor`,
+    which silently reports offline inside Flatpak sandboxes that can't
+    reach NetworkManager or the portal. Cached for `_IS_ONLINE_TTL`
+    seconds so the per-call cost is amortized across rapid UI binds."""
     now = time.monotonic()
     if _IS_ONLINE_CACHE["value"] is not None and now < _IS_ONLINE_CACHE["expires"]:
         return _IS_ONLINE_CACHE["value"]
@@ -35,9 +43,12 @@ def is_online():
     if force_offline:
         result = False
     else:
-        from gi.repository import Gio
-        monitor = Gio.NetworkMonitor.get_default()
-        result = monitor.get_network_available()
+        import socket
+        try:
+            with socket.create_connection(("music.youtube.com", 443), timeout=1.5):
+                result = True
+        except OSError:
+            result = False
 
     _IS_ONLINE_CACHE["value"] = result
     _IS_ONLINE_CACHE["expires"] = now + _IS_ONLINE_TTL

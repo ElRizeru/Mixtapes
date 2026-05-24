@@ -5,6 +5,7 @@ yt-dlp-ejs
 requests
 urllib3
 mutagen
+Pillow
 pydbus==0.6.0
 StrEnum==0.4.15
 mprisify @ git+https://gitlab.com/zehkira/mprisify.git@v1.0.0
