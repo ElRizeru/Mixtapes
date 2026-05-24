@@ -21,6 +21,7 @@ finish-args:
   - --persist=.
   - --device=dri
   - --socket=session-bus
+  - --system-talk-name=org.freedesktop.NetworkManager
   - --filesystem=xdg-music
   - --filesystem=xdg-run/app/com.discordapp.Discord
   - --filesystem=xdg-run/discord-ipc-0
