@@ -35,15 +35,6 @@ jobs:
           Write-Host "Login helper built:"
           Get-ChildItem dist/MixtapesLogin.exe
 
-      - name: Download Adwaita Sans font
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path windows/fonts
-          Invoke-WebRequest -Uri "https://gitlab.gnome.org/api/v4/projects/GNOME%2Fadwaita-fonts/repository/files/sans%2FAdwaitaSans-Regular.ttf/raw?ref=main" -OutFile "windows/fonts/AdwaitaSans-Regular.ttf"
-          $size = (Get-Item "windows/fonts/AdwaitaSans-Regular.ttf").Length
-          Write-Host "Font size: $size bytes"
-          if ($size -lt 10000) { throw "Font file too small" }
-
       - name: Setup MSYS2
         uses: msys2/setup-msys2@v2
         with:
@@ -122,10 +113,6 @@ jobs:
           cp windows/mixtapes.ico dist/mixtapes/windows/
           cp windows/mixtapes_256.png dist/mixtapes/windows/mixtapes.png
           cp dist/MixtapesLogin.exe dist/mixtapes/windows/ 2>/dev/null || true
-
-          # Bundle Adwaita Sans font
-          mkdir -p dist/mixtapes/fonts
-          cp windows/fonts/*.ttf dist/mixtapes/fonts/
 
           # Copy runtime binaries
           echo "Copying runtime binaries..."
