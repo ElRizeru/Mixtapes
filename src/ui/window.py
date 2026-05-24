@@ -745,8 +745,11 @@ class MainWindow(Adw.ApplicationWindow):
           2. The window's background-image rule pointing at the cached
              blurred PNG.
         """
-        from urllib.parse import quote
-        url = "file://" + quote(path)
+        # pathlib handles Windows drive letters + backslashes correctly
+        # (file:///C:/...); urllib.quote would percent-escape the colon
+        # and slashes and produce an unparseable URI for GTK's CSS loader.
+        from pathlib import Path
+        url = Path(path).as_uri()
         bg_rule = (
             "window.cover-bg-active {\n"
             f'    background-image: url("{url}");\n'
