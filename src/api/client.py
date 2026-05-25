@@ -422,18 +422,26 @@ class MusicClient:
         return self.api.search(query, *args, **kwargs)
 
     def find_audio_version(self, video_id, title=None, artists=None, *_, **__):
-        """Given a music-video (OMV/UGC/etc.) videoId, return the
-        videoId of its audio (ATV) counterpart — the album/song
-        version of the same release — or None if no counterpart exists
-        or the original is already an audio track.
+        """Given a music-video (OMV/UGC/etc.) videoId, return a dict
+        describing its audio (ATV) counterpart — the album/song
+        version of the same release — with keys
+        ``{"videoId", "title", "artists", "thumb"}``, or ``None`` if
+        no counterpart exists or the original is already an audio
+        track.
+
+        The ``thumb`` field matters: the album-cover image lives on a
+        different CDN than the music-video still, so the caller needs
+        the swapped thumb to avoid showing the video frame next to
+        the swapped-in audio.
 
         Two-step lookup:
 
         1. `get_watch_playlist().tracks[0].counterpart` — YT Music's
            own pairing (the data behind the "Switch to song version"
-           button). Authoritative when present. We also harvest
-           title/artists from this response so callers don't need to
-           pass them, and so we use the same names YT Music uses.
+           button). Authoritative when the counterpart is ATV. We
+           also harvest title/artists from this response so callers
+           don't need to pass them, and so we use the same names YT
+           Music uses.
 
         2. Songs-filtered search — fallback when YT Music didn't pair
            the song/video in its catalog (happens fairly often;
@@ -450,6 +458,8 @@ class MusicClient:
         cp_id = ""
         cp_type = ""
         cp_title = ""
+        cp_thumb = ""
+        cp_artists = None
         try:
             result = self.api.get_watch_playlist(videoId=video_id, limit=1)
         except Exception as e:
@@ -471,6 +481,11 @@ class MusicClient:
                 cp_id = counterpart.get("videoId") or ""
                 cp_type = (counterpart.get("videoType") or "").upper()
                 cp_title = counterpart.get("title") or "?"
+                cp_artists = counterpart.get("artists")
+                cp_thumb = self._best_thumb(
+                    counterpart.get("thumbnail")
+                    or counterpart.get("thumbnails")
+                )
 
         print(
             f"[swap-version] cur={video_id} type={cur_type or '?'} title={title!r}"
@@ -479,8 +494,17 @@ class MusicClient:
 
         if cur_type == "MUSIC_VIDEO_TYPE_ATV":
             return None
-        if cp_id and cp_id != video_id:
-            return cp_id
+        # Only follow the counterpart link when it actually points at
+        # the audio (ATV) side. Without this check, an unknown
+        # `cur_type` on a track that was secretly ATV would swap us
+        # *to* the music video — the opposite of what we want.
+        if cp_id and cp_id != video_id and cp_type == "MUSIC_VIDEO_TYPE_ATV":
+            return {
+                "videoId": cp_id,
+                "title": cp_title if cp_title != "?" else title,
+                "artists": cp_artists or artists,
+                "thumb": cp_thumb,
+            }
 
         # Fallback: songs-filtered search. Only attempt if we know
         # the current video isn't ATV (either confirmed by
@@ -501,6 +525,18 @@ class MusicClient:
         s = re.sub(r"[^\w\s]", " ", s)
         s = re.sub(r"\s+", " ", s).strip()
         return s
+
+    @staticmethod
+    def _best_thumb(thumbs):
+        """Pull the highest-resolution URL out of a ytmusicapi
+        thumbnail field. Accepts the list form, the {"thumbnails": [...]}
+        wrapper, or None."""
+        if isinstance(thumbs, dict):
+            thumbs = thumbs.get("thumbnails")
+        if not isinstance(thumbs, list) or not thumbs:
+            return ""
+        last = thumbs[-1]
+        return last.get("url", "") if isinstance(last, dict) else ""
 
     def _search_audio_version(self, video_id, title, artists):
         artist_name = ""
@@ -540,7 +576,12 @@ class MusicClient:
                 f"[swap-version] search fallback {video_id} → {r_vid}"
                 f" ({r_title!r})"
             )
-            return r_vid
+            return {
+                "videoId": r_vid,
+                "title": r_title,
+                "artists": r_artists,
+                "thumb": self._best_thumb(r.get("thumbnails")),
+            }
         print(
             f"[swap-version] no search match for {title!r} / {artist_name!r}"
         )
@@ -2098,7 +2139,8 @@ class MusicClient:
                 except Exception as e:
                     print(f"[swap-version] auto-swap failed for {vid}: {e}")
                     alt = None
-                swapped.append(alt or vid)
+                alt_id = alt.get("videoId") if isinstance(alt, dict) else None
+                swapped.append(alt_id or vid)
             video_ids = swapped
         try:
             self.api.add_playlist_items(playlist_id, video_ids, duplicates=duplicates)

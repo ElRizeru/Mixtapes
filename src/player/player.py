@@ -1330,19 +1330,48 @@ class Player(GObject.Object):
             and not track.get("entityId")  # uploads have no counterpart
         ):
             try:
-                swapped = self.client.find_audio_version(video_id)
+                swap_info = self.client.find_audio_version(video_id)
             except Exception as e:
                 print(f"[swap-version] lookup failed: {e}")
-                swapped = None
+                swap_info = None
             if generation != self.load_generation:
                 return
-            track["_swap_checked"] = True
+            swapped = (
+                swap_info.get("videoId") if isinstance(swap_info, dict) else None
+            )
+            # Only memoize success — a transient API failure shouldn't
+            # permanently pin this track to the music-video version.
+            if swapped:
+                track["_swap_checked"] = True
             if swapped and swapped != video_id:
                 print(
                     f"[swap-version] {video_id} → {swapped} ({track.get('title')})"
                 )
                 track["videoId"] = swapped
                 track["videoType"] = "MUSIC_VIDEO_TYPE_ATV"
+                # Pull the album-cover thumbnail from the swap result so
+                # the player bar / queue / MPRIS art stop showing the
+                # music-video still. Upgrade ytimg URLs to the same
+                # high-res form the rest of the player uses.
+                new_thumb = swap_info.get("thumb") or ""
+                if new_thumb and "ytimg.com" in new_thumb:
+                    new_thumb = get_high_res_url(new_thumb) or new_thumb
+                if new_thumb:
+                    track["thumb"] = new_thumb
+                    thumb_hint = new_thumb
+                new_title = swap_info.get("title")
+                if new_title:
+                    track["title"] = new_title
+                    title_hint = new_title
+                new_artists = swap_info.get("artists")
+                if isinstance(new_artists, list) and new_artists:
+                    first = new_artists[0]
+                    new_artist_name = (
+                        first.get("name", "") if isinstance(first, dict) else str(first)
+                    )
+                    if new_artist_name:
+                        track["artist"] = new_artist_name
+                        artist_hint = new_artist_name
                 video_id = swapped
                 self.current_video_id = swapped
                 GObject.idle_add(

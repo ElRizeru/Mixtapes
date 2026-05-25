@@ -47,6 +47,8 @@ class QueueRowWidget(Gtk.Box):
         self.handle = Gtk.Image.new_from_icon_name("list-drag-handle-symbolic")
         self.handle.add_css_class("dim-label")
         self.handle.add_css_class("drag-handle")
+        self.handle.set_margin_start(6)
+        self.handle.set_margin_end(4)
         self.append(self.handle)
 
         # Setup Drag Source
