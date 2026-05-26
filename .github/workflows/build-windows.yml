@@ -106,6 +106,13 @@ jobs:
           # Copy assets
           cp -r assets dist/mixtapes/
 
+          # Copy bundled fonts (Adwaita Sans + Mono). main.py installs
+          # these into %LOCALAPPDATA%\Microsoft\Windows\Fonts at first
+          # launch so fontconfig can find them. Skip if the dir is empty.
+          if [ -d fonts ]; then
+            cp -r fonts dist/mixtapes/
+          fi
+
           # Copy Rust launcher to root, helpers to windows/
           cp windows/bridge/target/release/Mixtapes.exe dist/mixtapes/
           mkdir -p dist/mixtapes/windows
@@ -113,6 +120,9 @@ jobs:
           cp windows/mixtapes.ico dist/mixtapes/windows/
           cp windows/mixtapes_256.png dist/mixtapes/windows/mixtapes.png
           cp dist/MixtapesLogin.exe dist/mixtapes/windows/ 2>/dev/null || true
+          # FontConfig configuration — main.py points FONTCONFIG_FILE
+          # at this so the fc backend knows where Windows keeps fonts.
+          cp windows/fonts.conf dist/mixtapes/windows/
 
           # Copy runtime binaries
           echo "Copying runtime binaries..."
