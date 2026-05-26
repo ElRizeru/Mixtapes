@@ -491,16 +491,20 @@ class DownloadDB:
             conn = self._connect()
             self._ensure_meta_json_column(conn)
 
-            # Regression check — look up what's already cached.
+            # Regression check — look up what's already cached. Use the
+            # stored ``track_count`` column instead of parsing the
+            # tracks_json blob; the previous code burned 50-100 ms in
+            # ``json.loads`` over ~1000 tracks just to learn a count we
+            # already wrote to disk.
             existing_count = 0
             try:
                 row = conn.execute(
-                    "SELECT tracks_json FROM library_cache WHERE playlist_id = ?",
+                    "SELECT track_count FROM library_cache WHERE playlist_id = ?",
                     (playlist_id,),
                 ).fetchone()
-                if row and row[0]:
-                    existing_count = len(json.loads(row[0]))
-            except (json.JSONDecodeError, sqlite3.OperationalError):
+                if row and row[0] is not None:
+                    existing_count = int(row[0])
+            except (sqlite3.OperationalError, TypeError, ValueError):
                 existing_count = 0
 
             new_count = len(tracks) if tracks else 0

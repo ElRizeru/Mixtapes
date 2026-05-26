@@ -83,6 +83,27 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="2026-26-05.0" date="2026-05-26">
+      <description>
+        <p>Gapless playback, a rewritten visualizer that syncs to the audio automatically, and a wave of fixes targeting the freezes and hangs that made big playlists feel sluggish.</p>
+        <ul>
+          <li>Gapless playback for queued tracks: when the next track's stream URL is already cached (downloaded files, or any track after the first in an album), playbin transitions without re-creating the pipeline — no audible gap between tracks</li>
+          <li>Visualizer now syncs to the audio out of the box: replaced the signal-based dispatch with a position-keyed pull queue that returns the spectrum frame the audio sink is actually playing right now. Works correctly across PipeWire, PulseAudio, and Bluetooth without needing manual latency calibration</li>
+          <li>Visualizer bars now decay to zero on pause instead of freezing on the last frame</li>
+          <li>Plain (unsynced) lyrics now render every line at full brightness instead of dimmed, so it's visually clear there's no active cursor to follow</li>
+          <li>Fix: opening a playlist with Wi-Fi off no longer freezes the UI for 30+ seconds. The library-saved check is now non-blocking and the menu corrects itself once the background populate lands</li>
+          <li>Fix: intermittent ~800ms UI hang when clicking a song or pressing next/previous. GStreamer state-change calls (which can block on HTTP socket teardown) now run on a worker thread</li>
+          <li>Fix: opening a big playlist online no longer stutters the slide-in animation. Disk-cache tail splice is chunked and delayed by 350ms to match the offline path's timing, and the live-data auto-refresh is delayed by 2 seconds so it doesn't fight the transition</li>
+          <li>Fix: per-row cover fetches no longer fire redundant web requests for downloaded tracks (local cover is now authoritative). Cuts hundreds of fetches when opening a big mostly-downloaded playlist</li>
+          <li>Fix: custom playlist cover URLs (i.ytimg.com/pl_c/…) now keep their signing parameters, so library tiles fetch on the first try instead of failing and falling back to the original URL</li>
+          <li>Fix: setting a queue with a large playlist no longer freezes the UI for ~800ms creating per-track carousel covers. The current viewport is created synchronously, the rest stream in via low-priority idle ticks</li>
+          <li>Fix: visualizer no longer desyncs</li>
+          <li>Fix: gapless transitions no longer drop the artist name or cover art on the next track. Both load paths now share the same metadata normalization</li>
+          <li>Fix: lyric matching is much stricter for generic-titled tracks. Providers must verify the result's artist matches the playing track before returning lyrics, so "Intro" / "Outro" / "Interlude" / "Track 01" no longer pick up some unrelated album's text</li>
+          <li>Fix: queue rows now show a subtle hover highlight in blurred-cover mode — previously the catch-all transparency rule wiped out libadwaita's default tint and the rows didn't read as clickable</li>
+        </ul>
+      </description>
+    </release>
     <release version="2026-24-05.0" date="2026-05-24">
       <description>
         <p>New home feed, built-in visualizer, smarter Add to Playlist, and a wave of visual polish around blurred cover backgrounds and the dynamic accent color. And of course bug fixes.</p>

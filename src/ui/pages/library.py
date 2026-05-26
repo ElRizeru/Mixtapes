@@ -852,24 +852,63 @@ class LibraryPage(Adw.Bin):
         if self._is_loading:
             return
         self._is_loading = True
+        # Show the spinner synchronously, BEFORE the worker thread starts.
+        # The library fetch is several seconds; the previous code only
+        # revealed the spinner from inside the worker via idle_add, which
+        # left a noticeable gap between the click and any visible
+        # feedback. We still only flash it on a cold load (the list is
+        # empty) so subsequent silent refreshes don't blink.
+        if not silent and self.playlists_list.get_row_at_index(0) is None:
+            self._loading_wrap.set_visible(True)
         thread = threading.Thread(target=self._fetch_library, args=(silent,))
         thread.daemon = True
         thread.start()
 
     def _fetch_library(self, silent=False):
         try:
-            # Only show full-screen loading UI if we have no data at all and
-            # the caller didn't explicitly opt out.
-            if not silent and self.playlists_list.get_row_at_index(0) is None:
-                GLib.idle_add(self._loading_wrap.set_visible, True)
+            # Fan the three independent library calls out across threads.
+            # Each is an HTTP round-trip (500 ms – 2 s); running them
+            # sequentially used to take 1.5–6 s before any UI updated,
+            # while there's nothing connecting them — they can finish in
+            # parallel and each render as soon as its result lands.
+            results = {"playlists": [], "albums": [], "artists": []}
 
-            playlists = self.client.get_library_playlists()
-            albums = self.client.get_library_albums()
-            artists = self.client.get_library_subscriptions()
+            def _fetch(key, fn, updater):
+                try:
+                    data = fn() or []
+                except Exception as e:
+                    print(f"[LIBRARY] {key} fetch failed: {e}")
+                    data = []
+                results[key] = data
+                # Render this section as soon as its own call returns —
+                # the user doesn't have to wait for the slowest sibling.
+                GObject.idle_add(updater, data)
 
-            GObject.idle_add(self.update_playlists, playlists if playlists else [])
-            GObject.idle_add(self.update_albums, albums if albums else [])
-            GObject.idle_add(self.update_artists, artists if artists else [])
+            threads = [
+                threading.Thread(
+                    target=_fetch,
+                    args=("playlists", self.client.get_library_playlists,
+                          self.update_playlists),
+                    daemon=True,
+                ),
+                threading.Thread(
+                    target=_fetch,
+                    args=("albums", self.client.get_library_albums,
+                          self.update_albums),
+                    daemon=True,
+                ),
+                threading.Thread(
+                    target=_fetch,
+                    args=("artists", self.client.get_library_subscriptions,
+                          self.update_artists),
+                    daemon=True,
+                ),
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
             GLib.idle_add(self._loading_wrap.set_visible, False)
             GLib.idle_add(self._apply_offline_state)
         finally:

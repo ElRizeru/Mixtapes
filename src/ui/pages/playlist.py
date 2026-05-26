@@ -1281,6 +1281,18 @@ class PlaylistPage(Adw.Bin):
         if root and hasattr(root, "library_page"):
             root.library_page.load_library()
 
+    def _recheck_library_status(self):
+        """Fires from MusicClient after the library cache populates async.
+        Updates the saved-to-library flag and rebuilds the menu so the
+        Save/Unsave entry reflects the now-known state."""
+        check_id = getattr(self, "_audio_playlist_id", None) or self.playlist_id
+        if not check_id:
+            return False
+        self._is_saved_to_library = getattr(self, "is_owned", False) or \
+            self.client.is_in_library(check_id)
+        self._refresh_more_menu(is_owned=getattr(self, "is_editable", False))
+        return False
+
     def _show_toast(self, message):
         show_toast(self, message)
 
@@ -1343,6 +1355,12 @@ class PlaylistPage(Adw.Bin):
 
     # ── Load playlist ─────────────────────────────────────────────────────────
 
+    # Delay the live-data refresh when we already have something to show.
+    # The chunked re-render of a big playlist would otherwise fight the
+    # page-open animation and stutter it. Cold loads (no cache) skip the
+    # delay since there's nothing on screen to compete with.
+    _AUTO_REFRESH_DELAY_MS = 2000
+
     def load_playlist(self, playlist_id, initial_data=None):
         if self.playlist_id != playlist_id:
             self.playlist_id = playlist_id
@@ -1361,6 +1379,8 @@ class PlaylistPage(Adw.Bin):
             self._load_playlist_offline(playlist_id, initial_data)
             return
 
+        has_cached_content = False
+
         if initial_data:
             self.playlist_title_text = initial_data.get("title", "")
             self.playlist_name_label.set_label(self.playlist_title_text)
@@ -1374,20 +1394,39 @@ class PlaylistPage(Adw.Bin):
 
             thumb = initial_data.get("thumb")
             if thumb:
-                if self.cover_img.url != thumb:
+                # Prefer the on-disk playlist cover when available. The web
+                # thumb is the same image (we mirrored it via
+                # save_playlist_cover_async), and an extra HTTPS round-trip
+                # here is one of the biggest visual stalls on big-playlist
+                # open — initial_data.title is what the cover file is keyed by.
+                local_cover = None
+                title_for_cover = initial_data.get("title")
+                if title_for_cover:
+                    from player.downloads import get_music_dir, _sanitize_filename
+                    candidate = os.path.join(
+                        get_music_dir(), "Playlists",
+                        f"{_sanitize_filename(title_for_cover)}.jpg",
+                    )
+                    if os.path.exists(candidate):
+                        local_cover = f"file://{candidate}"
+                cover_url = local_cover or thumb
+                if self.cover_img.url != cover_url:
                     self.cover_img.set_from_icon_name("media-playlist-audio-symbolic")
-                    self.cover_img.load_url(thumb)
+                    self.cover_img.load_url(cover_url)
             else:
                 self.cover_img.set_from_icon_name("media-playlist-audio-symbolic")
                 self.cover_img.url = None
 
             self.stack.set_visible_child_name("content")
-            self.content_spinner.set_visible(True)
 
             # Optimistic render from on-disk cache so the page fills with
             # content immediately while the fresh fetch runs. The
             # _fetch_playlist_details thread will re-render with live data.
+            # Don't flip the spinner on yet — _schedule_details_fetch owns
+            # that so the indicator appears together with the delayed fetch
+            # instead of during the page-open animation.
             self._populate_from_disk_cache(playlist_id, initial_data)
+            has_cached_content = True
         else:
             cached_tracks = self.client.get_cached_playlist_tracks(self.playlist_id)
             if cached_tracks is not None:
@@ -1397,11 +1436,7 @@ class PlaylistPage(Adw.Bin):
                 self.is_fully_loaded = True
                 self.original_tracks = list(cached_tracks)
                 self.current_tracks = list(cached_tracks)
-                thread = threading.Thread(
-                    target=self._fetch_playlist_details, args=(playlist_id,)
-                )
-                thread.daemon = True
-                thread.start()
+                self._schedule_details_fetch(playlist_id, delay=True)
                 return
 
             if self.stack.get_visible_child_name() != "content":
@@ -1415,11 +1450,24 @@ class PlaylistPage(Adw.Bin):
             else:
                 self.content_spinner.set_visible(False)
 
-        thread = threading.Thread(
-            target=self._fetch_playlist_details, args=(playlist_id,)
-        )
-        thread.daemon = True
-        thread.start()
+        self._schedule_details_fetch(playlist_id, delay=has_cached_content)
+
+    def _schedule_details_fetch(self, playlist_id, delay=False):
+        def start():
+            if self.playlist_id != playlist_id:
+                return False
+            self.content_spinner.set_visible(True)
+            thread = threading.Thread(
+                target=self._fetch_playlist_details, args=(playlist_id,)
+            )
+            thread.daemon = True
+            thread.start()
+            return False
+
+        if delay:
+            GLib.timeout_add(self._AUTO_REFRESH_DELAY_MS, start)
+        else:
+            start()
 
     def _populate_from_disk_cache(self, playlist_id, initial_data):
         """Render immediately from DownloadDB's playlist cache if we have it.
@@ -1535,7 +1583,6 @@ class PlaylistPage(Adw.Bin):
             thumbnails = payload["thumbnails"]
 
             self.stack.set_visible_child_name("content")
-            self.content_spinner.set_visible(True)
             self.playlist_title_text = title
             self.playlist_description_text = description
             self.playlist_name_label.set_label(title)
@@ -1620,30 +1667,45 @@ class PlaylistPage(Adw.Bin):
                 self.track_store.splice(0, 0, head)
                 tail = items[FIRST:]
                 if tail:
-                    # Yield to the event loop so the visible rows render
-                    # before we hit the model again with the long tail.
-                    # The tail splice only appends to the model — no new
-                    # widget binds — but the items-changed propagation
-                    # through FlattenListModel + ListView's measure pass
-                    # is still real work and we'd rather it land in a
-                    # separate frame.
-                    GLib.idle_add(
-                        self._apply_disk_cache_tail, tail_token, tail,
-                        priority=GLib.PRIORITY_LOW,
+                    # Wait for Adw.NavigationView's slide-in transition to
+                    # finish before populating the tail. This matches the
+                    # offline path's _populate_tracks_chunked (which uses
+                    # the same 350ms gate). Without it, the items-changed
+                    # propagation + ListView measure pass fires during the
+                    # transition and the animation visibly stutters even
+                    # though no single frame is catastrophically slow —
+                    # which was the exact "online stuttery, offline butter"
+                    # asymmetry the user was seeing.
+                    GLib.timeout_add(
+                        350, self._apply_disk_cache_tail, tail_token, tail,
                     )
 
             self.empty_label.set_visible(not items)
             self.is_fully_fetched = False
-            self.content_spinner.set_visible(True)
         except Exception as e:
             print(f"[DISK-CACHE] tracks apply failed: {e}")
         return False
 
     def _apply_disk_cache_tail(self, token, tail):
+        # Splicing 800+ items into a ListStore in a single idle callback
+        # pegged the main thread for ~150ms (py-spy: 439 main-thread samples
+        # inside this function on an 850-track playlist), which the user
+        # sees as a hard stutter right after the page opens. Splice in
+        # smaller chunks with idle yields between so layout/paint can
+        # interleave — total work is the same, but spread across frames.
         if token != getattr(self, "_track_populate_token", 0):
             return False
         try:
-            self.track_store.splice(self.track_store.get_n_items(), 0, tail)
+            CHUNK = 100
+            if not tail:
+                return False
+            head, rest = tail[:CHUNK], tail[CHUNK:]
+            self.track_store.splice(self.track_store.get_n_items(), 0, head)
+            if rest:
+                GLib.idle_add(
+                    self._apply_disk_cache_tail, token, rest,
+                    priority=GLib.PRIORITY_LOW,
+                )
         except Exception as e:
             print(f"[DISK-CACHE] tail apply failed: {e}")
         return False
@@ -2254,9 +2316,14 @@ class PlaylistPage(Adw.Bin):
         self.is_editable = self.client.is_authenticated() and not is_album and is_owned
         is_editable = self.is_editable
 
-        # Check library status for save/unsave toggle
+        # Check library status for save/unsave toggle. is_in_library is
+        # non-blocking — if the library cache is cold we get an optimistic
+        # False back, and the callback fires once the background populate
+        # lands so we can correct the menu state.
         check_id = getattr(self, "_audio_playlist_id", None) or self.playlist_id
-        self._is_saved_to_library = is_owned or self.client.is_in_library(check_id)
+        self._is_saved_to_library = is_owned or self.client.is_in_library(
+            check_id, on_cache_warmed=self._recheck_library_status
+        )
 
         # Dynamically rebuild the menu to show/hide Edit/Delete
         self._refresh_more_menu(is_owned=is_editable)

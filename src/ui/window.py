@@ -125,6 +125,16 @@ window.cover-bg-active .sidebar {
   background-color: transparent;
 }
 
+/* The desktop cover view's lyrics column is an Adw.OverlaySplitView with
+   the `.lyrics-split` class. Override the generic .sidebar-pane tint
+   above so the lyrics column reads as part of the cover background
+   rather than a darker panel floating in front of it. */
+window.cover-bg-active .lyrics-split > .sidebar-pane,
+window.cover-bg-active .lyrics-split > .sidebar-pane > .background {
+  background: none;
+  background-color: transparent;
+}
+
 window.cover-bg-active .queue-header {
   background-color: alpha(@window_bg_color, 0.25);
 }
@@ -184,6 +194,27 @@ window.cover-bg-active box.song-row.playing label,
 window.cover-bg-active listboxrow.song-row-wrapper.playing label,
 window.cover-bg-active .queue-row.playing label {
   color: @view_fg_color;
+}
+
+/* Queue rows lose libadwaita's default :hover tint to the
+   "all listview rows transparent" rule above — restore a subtle
+   hover so the row visibly responds to the pointer in blur mode.
+   Use @view_fg_color for theme-neutral contrast (same approach as
+   the .playing rule); kept lower-opacity so it's clearly weaker
+   than the playing highlight. */
+window.cover-bg-active .queue-row:hover {
+  background-color: alpha(@view_fg_color, 0.08);
+}
+window.cover-bg-active .queue-row.playing:hover {
+  background-color: alpha(@view_fg_color, 0.18);
+}
+
+/* Same fix for lyric lines — they're tap-to-seek and need the
+   pointer affordance, but the catch-all transparency above kills
+   the base hover defined in style.css. Slightly lighter than queue
+   rows since lyrics are content, not a list of actions. */
+window.cover-bg-active .lyrics-line:hover {
+  background-color: alpha(@view_fg_color, 0.06);
 }
 """
 
@@ -1728,7 +1759,7 @@ class MainWindow(Adw.ApplicationWindow):
         about.set_application_icon("com.pocoguy.Muse")
         about.set_application_name("Mixtapes")
         about.set_developer_name("POCOGuy")
-        about.set_version("2026-24-05.0")
+        about.set_version("2026.26.05-0")
         about.set_website("https://www.pocoguy.com/#!/mixtapes")
         about.set_copyright("© 2026 POCOGuy")
         about.set_license_type(Gtk.License.GPL_3_0)

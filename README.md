@@ -279,7 +279,7 @@ Without a `browser.json` file, the app falls back to the unauthenticated API, wh
 | ☑️ | **Settings** | Configure app preferences (theme, audio quality, etc.). |
 | ✅️ | **Cover Art Tint** | Tint Libadwaita to match cover art, kinda like Material You |
 | ✅️ | **Discord RPC** | Show your current track on Discord<br>✅️ Linux<br>✅️ Windows |
-| 🔜 | **Lyrics** | Synchronized lyrics, maybe using BetterLyrics API |
+| ✅️ | **Lyrics** | Synchronized lyrics using a bunch of providers (Apple Music, BetterLyrics, BiniLyrics, NetEase, LRCLIB, native YT Music) |
 | ✅️ | **Windows** | ✅️ GTK4/Libadwaita via MSYS2<br>✅️ GStreamer playback<br>✅️ SMTC media controls<br>✅️ System tray<br>✅️ Installer<br>✅️ Login helper (Edge WebView2) |
 | 🔜 | **macOS** | Can build it for macOS, just need to test, there's a PR for auto-builds. |
 | 🔜 | **GNOME Circle** | Still considering it, might not happen |

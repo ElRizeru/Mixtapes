@@ -142,11 +142,6 @@ class Player(GObject.Object):
             None,
             (str, str, str),
         ),  # video_id, title, error_message
-        "visualizer-data": (
-            GObject.SignalFlags.RUN_FIRST,
-            None,
-            (object,),
-        ),  # list[float] magnitudes (dB, threshold .. 0)
     }
 
     def __init__(self):
@@ -170,6 +165,11 @@ class Player(GObject.Object):
         # display real estate instead of treble dominating).
         self._visualizer_bands = 128
         self._visualizer_threshold_db = -80.0
+        # Position-keyed queue of (running_time_ns, bands) entries fed by
+        # the spectrum bus message and drained by pull_visualizer_bands.
+        # Sized for ~3s of buffer at the spectrum element's 30Hz tick.
+        from collections import deque
+        self._viz_queue = deque(maxlen=120)
         spectrum = Gst.ElementFactory.make("spectrum", "visualizer-spectrum")
         if spectrum is not None:
             spectrum.set_property("post-messages", True)
@@ -222,6 +222,14 @@ class Player(GObject.Object):
         self.bus = self.player.get_bus()
         self.bus.add_signal_watch()
         self.bus.connect("message", self.on_message)
+
+        # Gapless playback: about-to-finish fires when the current uri is
+        # close to ending. If we hand playbin a new uri synchronously in
+        # the handler, it switches without re-creating the pipeline — no
+        # NULL transition, no preroll, no audible gap. Critical for album
+        # listening where tracks are mastered to flow together.
+        self.player.connect("about-to-finish", self._on_about_to_finish)
+        self._pending_gapless_index = None  # set by about-to-finish, cleared by stream-start
 
         # Listen for external volume changes (system mixer)
         self.player.connect("notify::volume", self._on_external_volume_change)
@@ -665,6 +673,146 @@ class Player(GObject.Object):
 
         self.emit("state-changed", "queue-updated")
 
+    # ── Gapless handlers ──────────────────────────────────────────────────────
+
+    def _compute_next_gapless_index(self):
+        """Decide which queue index the current track should flow into,
+        applying repeat / end-of-queue rules. Returns None if no gapless
+        candidate exists (let the normal EOS path handle it)."""
+        if self.repeat_mode == "track":
+            return self.current_queue_index
+        cur = self.current_queue_index
+        if 0 <= cur and cur + 1 < len(self.queue):
+            return cur + 1
+        if self.repeat_mode == "all" and self.queue:
+            return 0
+        # Infinite radio queues *can* gapless-into the next track once
+        # the extend lands, but if the queue genuinely ran out at this
+        # moment we let EOS trigger the force-extend fallback.
+        return None
+
+    def _on_about_to_finish(self, _playbin):
+        """Runs on the GStreamer streaming thread. Must complete fast —
+        playbin uses whatever uri is set when this returns. yt-dlp
+        resolution is too slow to fit here, so we only enable gapless
+        when the next track's URL is already cached (file:// for
+        downloads, the StreamCache for streams). Upload tracks (tmpfs
+        path) are skipped — they need their own pre-buffering."""
+        nxt = self._compute_next_gapless_index()
+        if nxt is None or nxt >= len(self.queue):
+            return
+
+        track = self.queue[nxt]
+        if not track:
+            return
+        # Upload tracks need to be staged onto tmpfs before they're
+        # playable — defer to the normal _load_internal path on EOS.
+        if track.get("entityId"):
+            return
+
+        vid = track.get("videoId")
+        if not vid:
+            return
+
+        # Prefer a downloaded local copy (always works, offline-safe).
+        local_path = self.download_manager.get_local_path(vid)
+        if local_path:
+            try:
+                uri = GLib.filename_to_uri(os.path.abspath(local_path), None)
+            except Exception:
+                uri = None
+        else:
+            uri = self.stream_cache.get(vid)
+
+        if not uri:
+            # No cached URL → no gapless this time. EOS will fire and
+            # _load_internal will resolve via yt-dlp the normal way.
+            return
+
+        try:
+            self.player.set_property("uri", uri)
+            self._pending_gapless_index = nxt
+            print(
+                f"[GAPLESS] queued next uri for index={nxt} vid={vid} "
+                f"({'local' if local_path else 'cached'})"
+            )
+        except Exception as e:
+            print(f"[GAPLESS] failed to set next uri: {e}")
+            self._pending_gapless_index = None
+
+    def _apply_gapless_transition(self):
+        """Main-thread finisher for a gapless track swap. Mirrors the
+        post-load housekeeping in _load_internal — queue index, history,
+        metadata signal, MPRIS, precache — but skips everything pipeline-
+        related since playbin already handed the new uri off."""
+        nxt = self._pending_gapless_index
+        self._pending_gapless_index = None
+        if nxt is None or nxt < 0 or nxt >= len(self.queue):
+            return False
+
+        self.current_queue_index = nxt
+        track = self.queue[nxt]
+        # Use the same normalization path as _play_current_index — without
+        # this, freshly-queued tracks (where the dict only has `artists`
+        # and `thumbnails` lists, not yet the normalized `artist`/`thumb`
+        # strings) ship empty values to the UI and the user sees the
+        # artist disappear and covers stop loading on every gapless
+        # transition.
+        video_id, title, artist, thumb, like_status = (
+            self._normalize_track_metadata(track)
+        )
+
+        self.current_video_id = video_id
+        self._current_source_video_id = video_id
+        self.duration = -1
+        # Spectrum stream-times restart at 0 for the new uri, so the queue
+        # would otherwise be polluted by the previous track's tail.
+        self._viz_queue.clear()
+        # New track → fresh history-record gate.
+        self._history_recorded_for = None
+        if (
+            self._history_mode == "immediate"
+            and video_id
+            and self._history_recorded_for != video_id
+        ):
+            self._history_recorded_for = video_id
+            try:
+                self.client.add_history_item_async(video_id)
+            except Exception as e:
+                print(f"[HISTORY] gapless immediate record failed: {e}")
+
+        # Drop the previous track's tmpfs buffer (only used by upload
+        # tracks, which we skipped — but cheap to clear anyway).
+        if self._current_tmpfs_path:
+            self._cleanup_tmpfs_path(self._current_tmpfs_path)
+            self._current_tmpfs_path = None
+
+        self.load_generation += 1
+        current_gen = self.load_generation
+
+        self.emit(
+            "metadata-changed",
+            title, artist, thumb, video_id, like_status,
+        )
+        if thumb:
+            self._sync_mpris_art(thumb, video_id)
+        self._update_logical_state()
+        if hasattr(self, "mpris_events"):
+            try:
+                self.mpris_events.on_player_all()
+            except Exception as e:
+                print(f"mpris ERROR: {e}")
+        self.emit("state-changed", "queue-updated")
+
+        # Top up the cache for whatever comes after this newly-current track.
+        threading.Thread(
+            target=self._precache_next,
+            args=(current_gen,),
+            kwargs={"max_count": 1},
+            daemon=True,
+        ).start()
+        return False
+
     def _maybe_extend_infinite(self):
         """Trigger background fetch of more radio tracks when the queue is
         running low. Called from manual skip, next(), and seek paths.
@@ -827,43 +975,50 @@ class Player(GObject.Object):
             if hasattr(self, "mpris_events"):
                 self.mpris_events.on_options()
 
+    def _normalize_track_metadata(self, track):
+        """Resolve a queue entry's ytmusicapi-shaped fields into the
+        normalized strings the UI / MPRIS / Discord all consume. Persists
+        the normalized values back onto the queue dict so callers that
+        re-read it (like-button fallback, history page, the gapless
+        finisher) see the same strings the player already emitted.
+
+        Returns ``(video_id, title, artist, thumb, like_status)``.
+        """
+        video_id = str(track.get("videoId") or "")
+        title = str(track.get("title") or "Unknown")
+        artist = track.get("artist", "")
+        thumb = track.get("thumb")
+        like_status = str(track.get("likeStatus") or "INDIFFERENT")
+
+        if not artist and track.get("artists"):
+            artist = ", ".join(
+                [str(a.get("name", "")) for a in track.get("artists") if a]
+            )
+        if isinstance(artist, list):
+            artist = ", ".join([str(a.get("name", "")) for a in artist])
+        artist = str(artist or "")
+
+        if not thumb and track.get("thumbnails"):
+            thumbs = track.get("thumbnails")
+            if thumbs:
+                thumb = thumbs[-1]["url"]
+        thumb = str(thumb or "")
+        if "ytimg.com" in thumb:
+            thumb = get_high_res_url(thumb)
+
+        track["artist"] = artist
+        track["title"] = title
+        track["thumb"] = thumb
+        return video_id, title, artist, thumb, like_status
+
     def _play_current_index(self):
         if 0 <= self.current_queue_index < len(self.queue):
             self.load_media_api()
 
             track = self.queue[self.current_queue_index]
-            video_id = str(track.get("videoId") or "")
-            title = str(track.get("title") or "Unknown")
-            artist = track.get("artist", "")
-            thumb = track.get("thumb")
-            like_status = str(track.get("likeStatus") or "INDIFFERENT")
-
-            # Metadata Normalization & Persistence
-            # Handle raw ytmusicapi data and ensure persistent strings in the queue
-            if not artist and track.get("artists"):
-                artist = ", ".join(
-                    [str(a.get("name", "")) for a in track.get("artists") if a]
-                )
-
-            if isinstance(artist, list):
-                artist = ", ".join([str(a.get("name", "")) for a in artist])
-
-            artist = str(artist or "")
-
-            if not thumb and track.get("thumbnails"):
-                thumbs = track.get("thumbnails")
-                if thumbs:
-                    thumb = thumbs[-1]["url"]
-
-            thumb = str(thumb or "")
-            if "ytimg.com" in thumb:
-                thumb = get_high_res_url(thumb)
-
-            # SAVE BACK TO QUEUE to ensure UI refreshes (like fallbacks) use normalized strings
-            track["artist"] = artist
-            track["title"] = title
-            track["thumb"] = thumb
-
+            video_id, title, artist, thumb, like_status = (
+                self._normalize_track_metadata(track)
+            )
             self._load_internal(video_id, title, artist, thumb, like_status)
 
     def _load_internal(
@@ -878,8 +1033,28 @@ class Player(GObject.Object):
         self._current_source_video_id = video_id
 
         self._is_loading = True
+        # The new stream restarts running-time, so anything still queued
+        # from the previous track is now nonsense — drop it before the
+        # next visualizer tick pulls.
+        self._viz_queue.clear()
+        # Any in-flight gapless plan is now superseded by this manual
+        # load — the user (or our own next() / repeat path) is taking
+        # control of the pipeline. Don't let a late stream-start apply
+        # the obsolete index.
+        self._pending_gapless_index = None
+        # set_state(NULL) blocks until the pipeline flushes buffers and
+        # closes any open HTTP sockets — measured at ~800ms occasionally
+        # when the previous track was streaming. Running it on the main
+        # thread froze the UI on every skip. GStreamer state changes are
+        # documented thread-safe, so push it to a worker; _start_playback
+        # serializes against it via the same pipeline's internal lock and
+        # _is_loading already gates anyone reading pipeline state.
         try:
-            self.player.set_state(Gst.State.NULL)
+            threading.Thread(
+                target=self.player.set_state,
+                args=(Gst.State.NULL,),
+                daemon=True,
+            ).start()
         except Exception as e:
             print(f"set_state ERROR: {e}")
 
@@ -992,6 +1167,21 @@ class Player(GObject.Object):
         )
         thread.daemon = True
         thread.start()
+
+        # Eagerly precache *only* the immediate next track — that's the
+        # one the user is most likely to skip to. yt-dlp does heavy
+        # Python-side work (JSON parsing, JS interpretation) under the
+        # GIL; precaching 6 neighbours up front demonstrably starves the
+        # GTK main loop while the user opens a playlist or scrolls. The
+        # remaining neighbours are still pre-cached, but only after the
+        # current track's _fetch_and_play completes (see the trailing
+        # _precache_next call inside that method).
+        threading.Thread(
+            target=self._precache_next,
+            args=(current_gen,),
+            kwargs={"max_count": 1},
+            daemon=True,
+        ).start()
 
     def extend_queue(self, tracks):
         """Appends new tracks to the queue (and original_queue)."""
@@ -1604,8 +1794,17 @@ class Player(GObject.Object):
             msg = "Could not load this track"
         return msg[:140]
 
-    def _precache_next(self, generation):
-        """Pre-cache stream URLs for 3 songs ahead and 3 behind."""
+    def _precache_next(self, generation, max_count=None):
+        """Pre-cache stream URLs for songs ahead and behind in the queue.
+
+        ``max_count`` caps how many neighbours we resolve in this call.
+        We use ``max_count=1`` when this fires *eagerly* (at the start of
+        the current track's load) so the user sees no Next-press delay,
+        but we don't pile yt-dlp work onto the GIL while the playlist
+        page is being assembled. The full 6-neighbour sweep still fires
+        from the end of ``_fetch_and_play``, by which time the bind
+        storm has settled.
+        """
         if generation != self.load_generation:
             return
 
@@ -1618,9 +1817,21 @@ class Player(GObject.Object):
             if current - offset >= 0:
                 indices.append(current - offset)
 
-        from yt_dlp import YoutubeDL
+        if max_count is not None:
+            indices = indices[:max_count]
 
-        for idx in indices:
+        from yt_dlp import YoutubeDL
+        import time as _time
+
+        for i, idx in enumerate(indices):
+            if generation != self.load_generation:
+                return
+            # Throttle between extractions so the GIL stays free for the
+            # UI thread between batches. yt-dlp holds the GIL during JSON
+            # parse + JS interpretation; a brief release lets the main
+            # loop draw a frame.
+            if i > 0:
+                _time.sleep(0.25)
             if generation != self.load_generation:
                 return
             track = self.queue[idx]
@@ -1706,11 +1917,20 @@ class Player(GObject.Object):
             print(f"[PLAYER] source-setup hook error: {e}")
 
     def _start_playback(self, uri, cookie_file=None):
-        self.player.set_state(Gst.State.NULL)
-        self.player.set_property("uri", uri)
-        self.player.set_state(Gst.State.PLAYING)
-
-        # Direct URLs typically work without explicit cookies. Stale URLs are handled in _load_internal.
+        # NULL→URI→PLAYING must happen in order, but set_state(NULL) can
+        # block for hundreds of ms while GStreamer flushes the previous
+        # stream. Off-load the whole sequence to a worker so the UI
+        # thread doesn't pay for it. set_state is thread-safe and serializes
+        # against the (now also threaded) NULL transition kicked off in
+        # _load_internal via the pipeline's internal state-change lock.
+        def _drive():
+            try:
+                self.player.set_state(Gst.State.NULL)
+                self.player.set_property("uri", uri)
+                self.player.set_state(Gst.State.PLAYING)
+            except Exception as e:
+                print(f"[PLAYBACK] start failed: {e}")
+        threading.Thread(target=_drive, daemon=True).start()
         return False
 
     def play(self):
@@ -1724,6 +1944,7 @@ class Player(GObject.Object):
     def stop(self):
         self.player.set_state(Gst.State.NULL)
         self._is_loading = False
+        self._pending_gapless_index = None
         # Force stopped state immediately
         if self._current_logical_state != "stopped":
             self._current_logical_state = "stopped"
@@ -1746,40 +1967,112 @@ class Player(GObject.Object):
                 pass
 
     def _dispatch_spectrum_message(self, structure):
-        """Pull the per-band magnitude list out of a spectrum element bus
-        message and re-emit it as a `visualizer-data` signal.
+        """Queue the per-band magnitudes keyed by the audio's stream-time
+        (position within the current track). Visualizer widgets pull the
+        latest entry whose stream-time the audio sink has actually
+        reached — this gives free pipeline-clock sync without needing the
+        user to calibrate sink latency.
+
+        Stream-time, not running-time: after a seek, running-time keeps
+        advancing monotonically but `query_position(Gst.Format.TIME)`
+        returns the new (post-seek) stream-time. Mixing the two would
+        leave the bars stuck on stale data until the running-time delta
+        caught up. Both sides have to agree on the same clock.
 
         GStreamer's `spectrum` reports `magnitude` as a GstValueList in
         modern (≥1.20) builds and as a GValueArray on older systems.
-        PyGObject surfaces these very differently — sometimes as a plain
-        Python list, sometimes as an object with `.n_values` / `.get_nth`,
-        and sometimes via `Gst.Structure.get_list` returning (ok, list).
-        We try all three.
+        `_extract_spectrum_bands` walks all three shapes.
         """
-        # Diagnostic: print once on the first dispatched message so we
-        # can tell from the terminal whether the audio→spectrum→bus
-        # path is actually producing data (vs. failing silently
-        # somewhere upstream).
         if not getattr(self, "_visualizer_first_msg_logged", False):
             self._visualizer_first_msg_logged = True
             print("[VISUALIZER] first spectrum message received — data flowing")
 
-        # PyGObject surfaces GstValueList three different ways across
-        # GStreamer/PyGObject versions, none of them iterable in the
-        # plain Python sense:
-        #   - `structure.get_list("magnitude")` → (True, Gst.ValueArray)
-        #     on modern builds. ValueArray exposes .n_values + .get_nth(i).
-        #   - `structure.get_value("magnitude")` → either a plain list, a
-        #     GValueArray-like with .n_values, or it raises
-        #     `TypeError: unknown type GstValueList` (no PyGObject
-        #     converter registered for this GType). Walk both shapes.
         bands = _extract_spectrum_bands(structure)
         if not bands:
             return
-        self.emit("visualizer-data", bands)
+
+        try:
+            st_ok, stream_time_ns = structure.get_clock_time("stream-time")
+        except Exception:
+            st_ok = False
+            stream_time_ns = 0
+        if not st_ok:
+            # Older spectrum builds don't tag stream-time. Mark the entry
+            # with -1 so pull_visualizer_bands knows to return it ASAP
+            # (no sync available).
+            stream_time_ns = -1
+
+        self._viz_queue.append((int(stream_time_ns), bands))
+        # Cap the buffer to ~3s at 30Hz. Anything older than that is
+        # either past the play-head (will be trimmed on next pull) or
+        # so far ahead the user has already navigated past it.
+        while len(self._viz_queue) > 90:
+            self._viz_queue.popleft()
+
+    def pull_visualizer_bands(self):
+        """Return the spectrum bands the audio sink is currently playing,
+        or None. Driven by visualizer widgets on their UI tick — non-
+        destructive so multiple widgets (main + settings preview) can
+        share the same queue.
+
+        Returns None while paused / stopped so the widget's gravity loop
+        lets the bars fall to zero. If we returned the latest queued
+        entry instead, _ingest_magnitudes would re-snap the levels up to
+        it every tick and the bars would visibly freeze.
+
+        Strategy: walk the queue, return the most recent entry whose
+        stream_time ≤ current sink position, and drop entries that have
+        fallen >1s behind so the deque stays small.
+        """
+        if not self._viz_queue:
+            return None
+        try:
+            state = self.player.get_state(0)[1]
+        except Exception:
+            state = None
+        if state != Gst.State.PLAYING:
+            return None
+        try:
+            pos_ok, pos_ns = self.player.query_position(Gst.Format.TIME)
+        except Exception:
+            pos_ok, pos_ns = False, 0
+        if not pos_ok or pos_ns < 0:
+            # No clock to sync against (pre-roll, between tracks). Hand
+            # back the latest available; it'll be approximately right and
+            # the next tick will correct.
+            return self._viz_queue[-1][1]
+
+        latest = None
+        for rt, bands in self._viz_queue:
+            if rt < 0 or rt <= pos_ns:
+                latest = bands
+            else:
+                break
+
+        # Trim entries the play-head is more than a second past — old
+        # spectrum frames the sink can never reach again after the
+        # play-head moved on (e.g. after a seek forward or just normal
+        # advance).
+        stale_threshold = pos_ns - 1_000_000_000
+        while self._viz_queue and 0 <= self._viz_queue[0][0] < stale_threshold:
+            self._viz_queue.popleft()
+
+        return latest
 
     def on_message(self, bus, message):
         t = message.type
+        if t == Gst.MessageType.STREAM_START:
+            # Fired when playbin starts a new stream — for gapless this is
+            # the precise moment the pipeline switched to the uri we set
+            # in _on_about_to_finish. Catch up our state on the main thread.
+            if self._pending_gapless_index is not None:
+                print(
+                    f"[GAPLESS] stream-start for pending index="
+                    f"{self._pending_gapless_index}",
+                    flush=True,
+                )
+                GLib.idle_add(self._apply_gapless_transition)
+                return
         if t == Gst.MessageType.EOS:
             # Ignore EOS that arrives mid-load. When the user skips rapidly,
             # GStreamer can emit EOS for the *previous* stream as it tears
@@ -2133,6 +2426,7 @@ class Player(GObject.Object):
             pass
         return "immediate"
 
+
     def set_history_mode(self, mode):
         """Update the history-recording mode at runtime so the
         preferences switch takes effect on the next track without
@@ -2151,6 +2445,10 @@ class Player(GObject.Object):
         import time
 
         self.last_seek_time = time.time()
+        # Drop any spectrum entries queued before this seek — their
+        # stream-times are now in the past (forward seek) or the future
+        # (backward seek), either way they mislead pull_visualizer_bands.
+        self._viz_queue.clear()
 
         # Check whether the pipeline reports as seekable BEFORE attempting.
         # This is cheap, and lets us avoid trying a seek that we know will

@@ -23,8 +23,11 @@ def _load_pref(key, default):
 
 
 class Visualizer(Gtk.DrawingArea):
-    """CAVA-inspired bar visualizer driven by the Player's `visualizer-data`
-    signal (which forwards magnitudes from a GStreamer spectrum element).
+    """CAVA-inspired bar visualizer. Pulls spectrum bands from the Player
+    via `pull_visualizer_bands()` on every UI tick — the Player owns a
+    position-keyed queue of magnitudes posted by a GStreamer spectrum
+    element, and returns the entry whose audio running-time the sink has
+    actually reached so the bars stay in lock-step with playback.
 
     Pipeline per spectrum frame:
 
@@ -122,18 +125,12 @@ class Visualizer(Gtk.DrawingArea):
     # ─── Lifecycle ─────────────────────────────────────────────────────────
 
     def _on_realize(self, *_):
-        self._data_handler = self.player.connect(
-            "visualizer-data", self._on_data
-        )
-        print("[VIZ-WIDGET] realized, subscribed to visualizer-data signal")
+        # Pull-driven now: the tick callback queries player.pull_visualizer_bands
+        # on every frame, so there's no signal to subscribe to.
+        print("[VIZ-WIDGET] realized, will pull spectrum data on tick")
 
     def _on_unrealize(self, *_):
-        if hasattr(self, "_data_handler"):
-            try:
-                self.player.disconnect(self._data_handler)
-            except Exception:
-                pass
-            del self._data_handler
+        pass
 
     def _on_map(self, *_):
         self._active = True
@@ -223,18 +220,18 @@ class Visualizer(Gtk.DrawingArea):
                     out[right] = damped
         return out
 
-    # ─── Data → snap up ────────────────────────────────────────────────────
+    # ─── Pull fresh data + snap up ─────────────────────────────────────────
 
-    def _on_data(self, _player, magnitudes):
+    def _ingest_magnitudes(self, magnitudes):
+        if not magnitudes:
+            return
         if not getattr(self, "_viz_first_data_logged", False):
             self._viz_first_data_logged = True
             print(
-                f"[VIZ-WIDGET] first data callback fired "
-                f"(magnitudes={len(magnitudes) if magnitudes else 0}, "
+                f"[VIZ-WIDGET] first data pulled "
+                f"(magnitudes={len(magnitudes)}, "
                 f"visible={self.get_visible()}, mapped={self.get_mapped()})"
             )
-        if not magnitudes:
-            return
         bars = self._reduce(magnitudes)
 
         # Auto-sensitivity: scale toward AUTO_GAIN_TARGET based on a
@@ -260,12 +257,26 @@ class Visualizer(Gtk.DrawingArea):
                 self._levels[i] = h
                 self._velocities[i] = 0.0
 
-    # ─── Frame tick: gravity + redraw ──────────────────────────────────────
+    # ─── Frame tick: pull + gravity + redraw ───────────────────────────────
 
     def _on_tick(self):
         if not self._active:
             self._tick_id = None
             return False
+
+        # Pull whatever spectrum frame the audio sink has actually reached
+        # right now. The player's queue is keyed by running-time so widgets
+        # in different windows (main + settings preview) stay independently
+        # synced to playback without arguing over a shared cursor.
+        magnitudes = None
+        if hasattr(self.player, "pull_visualizer_bands"):
+            try:
+                magnitudes = self.player.pull_visualizer_bands()
+            except Exception:
+                magnitudes = None
+        if magnitudes is not None:
+            self._ingest_magnitudes(magnitudes)
+
         if not self._levels:
             return True
 

@@ -1,3 +1,20 @@
+/* Force a consistent CJK fallback across every widget. Without this,
+   different widgets pick different fallback fonts for Japanese / Chinese /
+   Korean glyphs (depending on which Pango layout context happens to be
+   used), so the same kanji can render in one font in the queue and another
+   in the lyrics view. Listing the Noto CJK families after Adwaita Sans
+   keeps Latin text in the system look while routing missing-glyph
+   fallbacks to the same CJK family everywhere.
+   NOTE: ``inherit`` is not valid inside a font-family list — GTK's CSS
+   parser drops the whole rule when it sees an invalid value, so we list
+   explicit family names instead. */
+* {
+  font-family: "Adwaita Sans", "Cantarell",
+               "Noto Sans CJK JP", "Noto Sans CJK SC",
+               "Noto Sans CJK TC", "Noto Sans CJK KR",
+               sans-serif;
+}
+
 @define-color scrim_top mix(@window_bg_color, transparent, 0.4);
 @define-color scrim_mid mix(@window_bg_color, transparent, 0.8);
 @define-color row_hover alpha(@accent_color, 0.08);
@@ -374,4 +391,194 @@ window > windowhandle,
 .sidebar-title {
     font-weight: 800;
     color: @theme_fg_color;
+}
+
+/* ── Lyrics view ───────────────────────────────────────────────────────── */
+
+.lyrics-view {
+  background: transparent;
+}
+
+/* Suppress the GTK4 ScrolledWindow "undershoot" shadows that appear at the
+   top/bottom edges when the content is scrollable. We're drawing our own
+   gradient fade via FadeEdgesBin and the two effects fight each other. */
+.lyrics-scroller undershoot.top,
+.lyrics-scroller undershoot.bottom,
+.lyrics-scroller overshoot.top,
+.lyrics-scroller overshoot.bottom {
+  background: none;
+  box-shadow: none;
+}
+
+/* The lyrics ListBox shouldn't paint its own background — the fade-edge
+   bin draws what's behind it. */
+.lyrics-list {
+  background: transparent;
+}
+
+/* Adw.OverlaySplitView paints a sidebar-pane background by default —
+   that's what makes the lyrics column look like a darker block in our
+   cover-tinted view. Wipe it (and the separator) so the lyrics blend
+   into the same cover-derived background as the rest of the view. */
+.lyrics-split > .sidebar-pane,
+.lyrics-split > .sidebar-pane > .background,
+.lyrics-split > .content-pane,
+.lyrics-split > .content-pane > .background {
+  background: none;
+  background-color: transparent;
+  box-shadow: none;
+}
+
+.lyrics-split > separator,
+.lyrics-split > .border {
+  background: none;
+  background-color: transparent;
+  border: none;
+  min-width: 0;
+}
+
+/* Each lyric line is a ListBoxRow. The Pango ``<span fgalpha='N'>``
+   attribute inside its label carries the active/inactive state via
+   per-glyph alpha, so the row itself just needs to clear the default
+   selection chrome (background pill, focus ring). Keeping the font-size
+   and weight uniform across all rows means the row's measured height
+   never changes on activation — that's what kept the previous design's
+   autoscroll target from settling. */
+.lyrics-line,
+.lyrics-line:active,
+.lyrics-line:focus,
+.lyrics-line:selected,
+.lyrics-line:checked {
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: none;
+  background-color: transparent;
+  box-shadow: none;
+  border: none;
+  outline: none;
+  min-height: 0;
+}
+
+/* Subtle hover so the user gets a clickable affordance — these rows
+   are tap-to-seek targets, but the default minimalist treatment made
+   them feel like static text. Kept low-opacity so it doesn't fight
+   the Pango alpha fade that carries the actual active-line state. */
+.lyrics-line:hover {
+  padding: 6px 8px;
+  border-radius: 8px;
+  background-color: alpha(@view_fg_color, 0.06);
+  box-shadow: none;
+  border: none;
+  outline: none;
+  min-height: 0;
+}
+
+.lyrics-line .lyrics-line-label {
+  font-size: 1.4em;
+  font-weight: 700;
+  color: @accent_color;
+}
+
+/* Floating icon-only menu button in the top-right of the lyrics view.
+   Soft translucent rounded-square so it sits gently over the lyrics
+   content, regardless of whether the background is bright album art
+   or chrome. No border — borders read as harsh ring-edges against
+   the lyrics text. */
+.lyrics-source-btn {
+  background-color: alpha(@window_bg_color, 0.55);
+  color: @theme_fg_color;
+  border-radius: 8px;
+  padding: 6px;
+  min-height: 0;
+  min-width: 0;
+  border: none;
+  box-shadow: 0 1px 3px alpha(black, 0.18);
+  transition: background-color 150ms ease, opacity 150ms ease;
+  opacity: 0.65;
+}
+
+.lyrics-source-btn:hover {
+  background-color: alpha(@window_bg_color, 0.85);
+  opacity: 1.0;
+}
+
+.lyrics-source-btn:active,
+.lyrics-source-btn:checked {
+  background-color: alpha(@accent_color, 0.25);
+  opacity: 1.0;
+}
+
+/* Source-picker list inside the popover — mirrors .add-to-playlist-list:
+   the .boxed-list border/shadow combo turns each row into its own card
+   inside the popover, which reads as cluttered. We use navigation-
+   sidebar's hover effect and trim the default theme padding. */
+.lyrics-source-list > row {
+  padding: 4px 8px;
+  border-radius: 6px;
+}
+
+/* MenuButton renders its content inside an internal `button` child. We
+   paint the disc on the outer .lyrics-source-btn; the inner button has
+   to be invisible or it draws a second background pill that reads as a
+   "weird ring" around the icon. */
+.lyrics-source-btn > button,
+.lyrics-source-btn > button:hover,
+.lyrics-source-btn > button:active,
+.lyrics-source-btn > button:checked {
+  background: none;
+  background-color: transparent;
+  border: none;
+  box-shadow: none;
+  outline: none;
+  min-height: 0;
+  min-width: 0;
+  padding: 0;
+}
+
+.lyrics-toggle-btn > button,
+.lyrics-toggle-btn > button:hover,
+.lyrics-toggle-btn > button:active,
+.lyrics-toggle-btn > button:checked {
+  background: none;
+  background-color: transparent;
+  border: none;
+  box-shadow: none;
+  outline: none;
+  min-height: 0;
+  min-width: 0;
+  padding: 0;
+}
+
+/* Compact icon-only toggle overlaid in the top-right of the cover art.
+   Same soft rounded-square look as .lyrics-source-btn so the two
+   buttons read as a family. Brighter accent fill when the lyrics
+   column is currently shown. */
+.lyrics-toggle-btn {
+  background-color: alpha(@window_bg_color, 0.55);
+  color: @theme_fg_color;
+  border-radius: 8px;
+  padding: 6px;
+  min-height: 0;
+  min-width: 0;
+  border: none;
+  box-shadow: 0 1px 3px alpha(black, 0.18);
+  transition: background-color 150ms ease, opacity 150ms ease;
+  opacity: 0.65;
+}
+
+.lyrics-toggle-btn:hover {
+  background-color: alpha(@window_bg_color, 0.85);
+  opacity: 1.0;
+}
+
+.lyrics-toggle-btn:checked {
+  background-color: alpha(@accent_color, 0.35);
+  color: @accent_color;
+  opacity: 1.0;
+}
+
+/* Static (unsynced) lyrics: no hover affordance, full opacity so the body
+   text is legible even though it isn't interactive. */
+.lyrics-line-static > label {
+  opacity: 0.9;
 }

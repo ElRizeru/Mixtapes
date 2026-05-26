@@ -93,8 +93,13 @@ class SearchPage(Adw.Bin):
         self._explore_loading = False
         self._explore_retry_count = 0
 
-        # Load explore data
-        self.load_explore_data()
+        # Kick off the Explore fetch on an idle tick so it doesn't
+        # compete with the rest of the UI's initial layout. The fetch
+        # itself runs on a worker thread, so this only buys us the
+        # widget-construction breathing room — but means the user lands
+        # on a populated Explore tab the first time they click into it
+        # rather than an empty screen.
+        GLib.idle_add(self.load_explore_data)
 
         # Player listeners
         self.loading_row_spinner = None
@@ -208,22 +213,47 @@ class SearchPage(Adw.Bin):
         if not is_online():
             GObject.idle_add(self.update_explore_ui, None)
             return
+        # Three independent HTTP calls — fire in parallel. ``explore`` is
+        # required (the page can't render without it); ``categories`` and
+        # ``charts`` are optional enrichment that get merged in. We run
+        # the optional ones on side threads while the main thread waits
+        # for the explore call, then join.
+        country = getattr(self, "_charts_country", "ZZ")
+        results = {"categories": None, "charts": None}
+
+        def _fetch_categories():
+            try:
+                results["categories"] = self.client.get_mood_categories()
+            except Exception as e:
+                print(f"Error fetching mood categories: {e}")
+
+        def _fetch_charts():
+            try:
+                results["charts"] = self.client.get_charts(country)
+            except Exception as e:
+                print(f"Error fetching charts: {e}")
+
+        cat_t = threading.Thread(target=_fetch_categories, daemon=True)
+        ch_t = threading.Thread(target=_fetch_charts, daemon=True)
+        cat_t.start()
+        ch_t.start()
+
         try:
             explore = self.client.get_explore()
-            categories = self.client.get_mood_categories()
-            if categories:
-                explore["separated_categories"] = categories
-            # Fetch charts
-            country = getattr(self, '_charts_country', 'ZZ')
-            try:
-                charts = self.client.get_charts(country)
-                explore["_charts"] = charts
-            except Exception:
-                pass
-            GObject.idle_add(self.update_explore_ui, explore)
         except Exception as e:
             print(f"Error fetching explore data: {e}")
             GObject.idle_add(self.update_explore_ui, None)
+            return
+
+        # Wait for the side fetches before rendering so the page lays
+        # out once with everything in place instead of re-flowing.
+        cat_t.join()
+        ch_t.join()
+        if results["categories"]:
+            explore["separated_categories"] = results["categories"]
+        if results["charts"]:
+            explore["_charts"] = results["charts"]
+        GObject.idle_add(self.update_explore_ui, explore)
 
     def update_explore_ui(self, data):
         self._explore_loading = False

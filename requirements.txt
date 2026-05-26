@@ -1,4 +1,5 @@
 PyGObject
+numpy
 ytmusicapi
 yt-dlp
 yt-dlp-ejs

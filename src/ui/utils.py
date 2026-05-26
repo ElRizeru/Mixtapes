@@ -7,59 +7,99 @@ import re
 from gi.repository import Gtk, Gdk, GObject, GLib, GdkPixbuf
 
 
-# is_online() result cached briefly to avoid stat+open+json.load on every
-# row bind / image fetch / right-click menu build. The result is conservative:
-# the force_offline flag rarely flips, and the NetworkMonitor query is fast on
-# its own — the disk I/O is the part that's expensive at scale.
-_IS_ONLINE_CACHE = {"value": None, "expires": 0.0}
-_IS_ONLINE_TTL = 2.0  # seconds
+# is_online() is called from every bind path that greys out offline rows —
+# i.e. hundreds of times during a normal playlist open and on every scroll.
+# Previously the TCP probe ran synchronously on the UI thread (with up to a
+# 1.5 s timeout!) every couple of seconds when the 2 s TTL expired, which is
+# the single biggest source of bind-time stutter. Now the sync entry point
+# *never* blocks: it returns the last known value from a background-refreshed
+# state, optimistically True if we haven't probed yet.
+import threading as _is_online_threading
+
+_IS_ONLINE_LOCK = _is_online_threading.Lock()
+_IS_ONLINE_STATE = {
+    "value": True,            # optimistic default — callers degrade gracefully if wrong
+    "last_probe": 0.0,        # monotonic timestamp of last probe completion
+    "probe_in_flight": False,
+}
+_IS_ONLINE_PROBE_INTERVAL = 15.0   # how stale the cached value is allowed to get
+
+_FORCE_OFFLINE_CACHE = {"value": False, "expires": 0.0}
+_FORCE_OFFLINE_TTL = 10.0
 
 
-def is_online():
-    """Check if we have network connectivity. Respects force-offline setting.
-
-    Implementation: short TCP connect to `music.youtube.com:443` —
-    cheap (sub-50ms when actually online), exercises DNS + reachability
-    of the service we actually depend on, and avoids pinging an
-    unrelated third party. Far more reliable than `Gio.NetworkMonitor`,
-    which silently reports offline inside Flatpak sandboxes that can't
-    reach NetworkManager or the portal. Cached for `_IS_ONLINE_TTL`
-    seconds so the per-call cost is amortized across rapid UI binds."""
+def _check_force_offline():
+    """Return the force_offline pref, cached for ``_FORCE_OFFLINE_TTL``
+    seconds to avoid hammering the disk on every bind."""
     now = time.monotonic()
-    if _IS_ONLINE_CACHE["value"] is not None and now < _IS_ONLINE_CACHE["expires"]:
-        return _IS_ONLINE_CACHE["value"]
-
+    if now < _FORCE_OFFLINE_CACHE["expires"]:
+        return _FORCE_OFFLINE_CACHE["value"]
     import json
     prefs_path = os.path.join(GLib.get_user_data_dir(), "muse", "prefs.json")
-    force_offline = False
+    result = False
     try:
         if os.path.exists(prefs_path):
             with open(prefs_path) as f:
-                prefs = json.load(f)
-            force_offline = bool(prefs.get("force_offline"))
+                result = bool(json.load(f).get("force_offline"))
     except Exception:
         pass
-
-    if force_offline:
-        result = False
-    else:
-        import socket
-        try:
-            with socket.create_connection(("music.youtube.com", 443), timeout=1.5):
-                result = True
-        except OSError:
-            result = False
-
-    _IS_ONLINE_CACHE["value"] = result
-    _IS_ONLINE_CACHE["expires"] = now + _IS_ONLINE_TTL
+    _FORCE_OFFLINE_CACHE["value"] = result
+    _FORCE_OFFLINE_CACHE["expires"] = now + _FORCE_OFFLINE_TTL
     return result
 
 
+def _kick_online_probe(now):
+    """Spawn a background probe if it's been a while since the last one
+    and no probe is currently in flight."""
+    with _IS_ONLINE_LOCK:
+        if _IS_ONLINE_STATE["probe_in_flight"]:
+            return
+        if now - _IS_ONLINE_STATE["last_probe"] < _IS_ONLINE_PROBE_INTERVAL:
+            return
+        _IS_ONLINE_STATE["probe_in_flight"] = True
+
+    def _probe():
+        import socket
+        try:
+            with socket.create_connection(
+                ("music.youtube.com", 443), timeout=2.0
+            ):
+                result = True
+        except OSError:
+            result = False
+        with _IS_ONLINE_LOCK:
+            _IS_ONLINE_STATE["value"] = result
+            _IS_ONLINE_STATE["last_probe"] = time.monotonic()
+            _IS_ONLINE_STATE["probe_in_flight"] = False
+
+    _is_online_threading.Thread(target=_probe, daemon=True).start()
+
+
+def is_online():
+    """Return the most recently observed network state. **Never blocks
+    the calling thread.**
+
+    A short TCP connect to ``music.youtube.com:443`` runs on a background
+    thread roughly every ``_IS_ONLINE_PROBE_INTERVAL`` seconds; this
+    function returns whatever the last probe set (optimistically True
+    until the first probe completes). Callers that need a real-time
+    answer should rely on the *actual* network call failing — failing a
+    request to YT directly is a better signal than pre-probing anyway.
+    """
+    if _check_force_offline():
+        return False
+    _kick_online_probe(time.monotonic())
+    with _IS_ONLINE_LOCK:
+        return _IS_ONLINE_STATE["value"]
+
+
 def invalidate_is_online_cache():
-    """Call from settings UI right after toggling force_offline so the next
-    is_online() reflects the change immediately instead of waiting for TTL."""
-    _IS_ONLINE_CACHE["value"] = None
-    _IS_ONLINE_CACHE["expires"] = 0.0
+    """Force the next ``is_online()`` to re-probe in the background.
+    Call after toggling the force_offline pref or after a NetworkMonitor
+    state change."""
+    _FORCE_OFFLINE_CACHE["expires"] = 0.0
+    with _IS_ONLINE_LOCK:
+        _IS_ONLINE_STATE["last_probe"] = 0.0
 
 # Bounded LRU Cache to prevent memory leaks (max 100 images). The cache is
 # read/written by multiple worker threads and the main thread, so every
@@ -281,8 +321,13 @@ def get_high_res_url(url, target_size=None):
 
     # 1. Clean up parameters that constrain resolution
     # Strip sqp and rs which are often used to force small/safe thumbnails
-    # CRITICAL: Locker track thumbnails (vi_locker) REQUIRE the rs parameter.
-    if "vi_locker" not in url:
+    # CRITICAL: Some URL families REQUIRE these params and 404 without them:
+    #   - vi_locker (locker tracks)
+    #   - pl_c (custom playlist covers — sqp/rs are signed access tokens)
+    # Stripping them on pl_c made every library tile fail its primary fetch
+    # and fall back to the original URL, doubling the network load when
+    # opening anything while the library grid is still hydrating.
+    if "vi_locker" not in url and "/pl_c/" not in url:
         clean_url = re.sub(r"([?&])(sqp|rs)=[^&]*&?", r"\1", url)
         clean_url = clean_url.replace("?&", "?").rstrip("?&")
     else:
@@ -694,10 +739,39 @@ class AsyncImage(Gtk.Image):
     def _get_local_cover(video_id):
         return resolve_local_cover(video_id)
 
+    # Viewport-aware fetch deferral. When a ListView row is bound for a
+    # track that isn't currently on-screen (initial layout, prefetch buffer,
+    # fast scroll-through), we don't actually want to spend executor time
+    # fetching its cover — the row may scroll out before the user ever
+    # sees it. Defer the submit_fetch until the widget is mapped; cache
+    # hits still paint synchronously so already-loaded rows are instant.
+    def _queue_fetch(self, fn, *args):
+        if self.get_mapped():
+            submit_fetch(fn, *args)
+            return
+        self._pending_fetch = (fn, args)
+        if not getattr(self, "_map_handler_id", None):
+            self._map_handler_id = self.connect("map", self._on_mapped_fetch)
+
+    def _on_mapped_fetch(self, _widget):
+        pending = getattr(self, "_pending_fetch", None)
+        if not pending:
+            return
+        fn, args = pending
+        self._pending_fetch = None
+        # The first positional arg to _fetch_image is the URL it was queued
+        # for. If load_url has since pointed this widget at a different URL
+        # (recycled to a new track), drop the stale fetch.
+        if args and args[0] != self.url:
+            return
+        submit_fetch(fn, *args)
+
     def load_url(self, url, **kwargs):
         orig_url = url
         url = get_high_res_url(url, self.target_w)
         self.url = url
+        # A new URL invalidates any previously deferred fetch.
+        self._pending_fetch = None
 
         vid = getattr(self, 'video_id', None)
 
@@ -714,28 +788,26 @@ class AsyncImage(Gtk.Image):
         # No cached pixbuf — check for a downloaded copy. resolve_local_cover
         # is O(1) after first resolution and skips entirely for non-downloaded
         # tracks, so this no longer blocks the UI on playlist open.
+        #
+        # Local covers are authoritative for downloaded tracks: skip the web
+        # fetch entirely (online and offline alike). Previously online mode
+        # would apply the local cover AND still queue a web fetch per row,
+        # which is what made opening a big mostly-downloaded playlist drag.
         local = resolve_local_cover(vid) if vid else None
-        if local and local in IMG_CACHE:
+        if local:
             self.url = local
-            self._apply_pixbuf(IMG_CACHE[local], local)
-            IMG_CACHE.move_to_end(local)
-            if not is_online():
-                return
-        elif local:
-            self.url = local
-            submit_fetch(self._fetch_image, local, [], None)
-            if not is_online():
-                return
+            if local in IMG_CACHE:
+                self._apply_pixbuf(IMG_CACHE[local], local)
+                IMG_CACHE.move_to_end(local)
+            else:
+                self._queue_fetch(self._fetch_image, local, [], None)
+            return
 
         if not url:
-            if local:
-                return  # local cover thread already started above
             self.set_from_icon_name("image-missing-symbolic")
             return
 
-        # Only show placeholder if we don't already have a valid image
-        # and no local cover is loading
-        if not local and (not self.get_paintable() or self._is_placeholder):
+        if not self.get_paintable() or self._is_placeholder:
             self.set_from_icon_name("image-missing-symbolic")
             self._is_placeholder = True
 
@@ -744,7 +816,7 @@ class AsyncImage(Gtk.Image):
             fallbacks.append(orig_url)
 
         self.url = url  # Update so _apply_pixbuf accepts the web result
-        submit_fetch(self._fetch_image, url, fallbacks, None)
+        self._queue_fetch(self._fetch_image, url, fallbacks, None)
 
     def _fetch_image(self, url, fallbacks=None, cached_pixbuf=None):
         # Skip stale work: if the widget has moved on (fast scroll, re-bind to
@@ -1004,10 +1076,32 @@ class AsyncPicture(Gtk.Picture):
             self.set_paintable(None)
             self._is_placeholder = True
 
+    # Viewport-aware fetch deferral — see AsyncImage._queue_fetch above
+    # for rationale. Identical mechanism, separate class because Gtk.Picture
+    # and Gtk.Image don't share a base.
+    def _queue_fetch(self, fn, *args):
+        if self.get_mapped():
+            submit_fetch(fn, *args)
+            return
+        self._pending_fetch = (fn, args)
+        if not getattr(self, "_map_handler_id", None):
+            self._map_handler_id = self.connect("map", self._on_mapped_fetch)
+
+    def _on_mapped_fetch(self, _widget):
+        pending = getattr(self, "_pending_fetch", None)
+        if not pending:
+            return
+        fn, args = pending
+        self._pending_fetch = None
+        if args and args[0] != self.url:
+            return
+        submit_fetch(fn, *args)
+
     def load_url(self, url, **kwargs):
         orig_url = url
         url = get_high_res_url(url, self.target_size)
         self.url = url
+        self._pending_fetch = None
 
         target_size = self.target_size
         crop = self.crop_to_square
@@ -1022,30 +1116,24 @@ class AsyncPicture(Gtk.Picture):
             self._apply_pixbuf(pixbuf, url)
             return
 
-        # No cached pixbuf — check for a downloaded copy. resolve_local_cover
-        # is O(1) after first resolution and skips entirely for non-downloaded
-        # tracks, so this no longer blocks the UI on playlist open.
+        # No cached pixbuf — check for a downloaded copy. Local cover is
+        # authoritative for downloaded tracks; skip the web fetch entirely
+        # (matches the AsyncImage fix above — see that comment for context).
         local = resolve_local_cover(self.video_id) if self.video_id else None
-        if local and local in IMG_CACHE:
+        if local:
             self.url = local
-            self._apply_pixbuf(IMG_CACHE[local], local)
-            IMG_CACHE.move_to_end(local)
-            if not is_online():
-                return
-        elif local:
-            self.url = local
-            submit_fetch(self._fetch_image, local, target_size, crop, [])
-            if not is_online():
-                return
+            if local in IMG_CACHE:
+                self._apply_pixbuf(IMG_CACHE[local], local)
+                IMG_CACHE.move_to_end(local)
+            else:
+                self._queue_fetch(self._fetch_image, local, target_size, crop, [])
+            return
 
         if not url:
-            if local:
-                return  # local cover thread already started
             self.set_paintable(None)
             return
 
-        # Only show placeholder if no local cover is loading
-        if not local and (not self.get_paintable() or self._is_placeholder):
+        if not self.get_paintable() or self._is_placeholder:
             self.set_from_icon_name("image-missing-symbolic")
             self._is_placeholder = True
 
@@ -1054,7 +1142,7 @@ class AsyncPicture(Gtk.Picture):
             fallbacks.append(orig_url)
 
         self.url = url  # Update so _apply_pixbuf accepts the web result
-        submit_fetch(self._fetch_image, url, target_size, crop, fallbacks)
+        self._queue_fetch(self._fetch_image, url, target_size, crop, fallbacks)
 
     def _fetch_image(self, url, target_size=None, crop=False, fallbacks=None):
         # Skip stale work: if the widget has moved on (fast scroll, re-bind to

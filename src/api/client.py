@@ -177,6 +177,337 @@ def _extract_shelf_header_meta(row):
     return None
 
 
+def _ttml_time_to_seconds(value):
+    """Parse a TTML time expression to seconds. Handles the formats the
+    BetterLyrics endpoint emits: bare seconds ("24.111"), M:SS.sss
+    ("1:03.364"), and H:MM:SS.sss. Returns ``None`` on parse failure
+    so callers can degrade to unsynced lines."""
+    if not value:
+        return None
+    try:
+        parts = str(value).split(":")
+        if len(parts) == 1:
+            return float(parts[0])
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + float(parts[1])
+        if len(parts) == 3:
+            return (
+                int(parts[0]) * 3600
+                + int(parts[1]) * 60
+                + float(parts[2])
+            )
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _result_rank(res):
+    """Score a lyrics-fetch result so the chain can pick the richest hit.
+    3 = word-level (line carries ``parts``); 2 = line-synced; 1 = plain
+    text; 0 = nothing usable."""
+    if not res or not res.get("lines"):
+        return 0
+    if any(l.get("parts") for l in res.get("lines", [])):
+        return 3
+    if res.get("synced"):
+        return 2
+    return 1
+
+
+def _norm_artist_for_match(s):
+    """Strip everything but alphanumerics + lowercase. Lets us compare
+    artists across providers that format the same name differently
+    (e.g. ``Daft Punk`` vs ``daft-punk`` vs ``Daft Punk feat. Pharrell``)."""
+    if not s:
+        return ""
+    import re as _re
+    return _re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def _artist_matches(expected, found):
+    """True if ``found`` plausibly belongs to the same artist as
+    ``expected``. Generous so feat. credits and minor punctuation drift
+    don't cost us a real match; tight enough to reject "Intro" by a
+    completely unrelated artist."""
+    e = _norm_artist_for_match(expected)
+    f = _norm_artist_for_match(found)
+    if not e or not f:
+        # If either side is missing we can't verify — let the caller
+        # decide. Callers that REQUIRE verification (generic-title path)
+        # should reject when this returns False.
+        return False
+    return e in f or f in e
+
+
+_GENERIC_TITLE_WORDS = {
+    "intro", "outro", "interlude", "skit", "prelude", "overture",
+    "untitled", "bonus", "bonustrack", "instrumental", "reprise",
+    "epilogue", "prologue",
+}
+
+
+def _is_generic_title(title):
+    """True when the title alone is too common to identify the track
+    (e.g. ``Intro``, ``Track 01``). Tells the lyrics chain to refuse
+    any provider result whose artist field doesn't match — otherwise
+    we'd happily pick up some random album's `Intro` lyrics whenever
+    LRCLIB's exact-match endpoint 404s."""
+    if not title:
+        return True
+    import re as _re
+    norm = _re.sub(r"[^a-z0-9 ]", "", title.lower()).strip()
+    if not norm:
+        return True
+    compact = norm.replace(" ", "")
+    if compact in _GENERIC_TITLE_WORDS:
+        return True
+    if _re.fullmatch(r"track\s*0*\d+", norm):
+        return True
+    return False
+
+
+def _title_variants(title):
+    """Return a deduplicated, order-preserving list of title strings to
+    try when looking up lyrics. Catches the common YouTube Music shapes
+    that lose us matches:
+
+    - ``Original - Translation`` (often kanji/kana followed by an English
+      gloss); both halves are valid lookups on lyrics DBs.
+    - ``Song (feat. Artist)`` / ``Song (Remastered 2009)``; the
+      parenthetical isn't part of the canonical title.
+    """
+    import re
+    if not title:
+        return []
+
+    out = []
+    def _add(t):
+        t = (t or "").strip()
+        if t and t not in out:
+            out.append(t)
+
+    _add(title)
+
+    # Split on the ``-`` separator that YT Music uses for translations.
+    # Real songs that legitimately contain dashes ("U-Turn", "Brain-Stew")
+    # use a hyphen without surrounding spaces, so the spaced variant is a
+    # safe signal for the translation pattern.
+    if " - " in title:
+        parts = [p.strip() for p in title.split(" - ") if p.strip()]
+        # The translation is usually the latter half (e.g. ``イガク - Medicine``),
+        # which is what English lyrics DBs key on; prefer it before the original.
+        for p in reversed(parts):
+            _add(p)
+
+    # Strip parenthetical/bracket suffixes once at a time so we get both
+    # ``Song`` and ``Song (Bonus Track)``.
+    stripped = re.sub(r"\s*[\(\[][^)\]]*[\)\]]\s*$", "", title).strip()
+    _add(stripped)
+
+    return out
+
+
+def _paxsenix_to_lines(data):
+    """Convert a Paxsenix ``/apple-music/lyrics`` JSON response into our
+    normalized ``{lines, synced, source}`` format.
+
+    Schema:
+        type     = "Syllable" (word-level), "Line" (line-level), or "None" (plain)
+        content  = [{ timestamp, endtime, text: [{text, timestamp, endtime}, ...] }]
+    """
+    if not isinstance(data, dict):
+        return None
+    kind = data.get("type")
+    content = data.get("content") or []
+    if not content:
+        return None
+
+    lines = []
+    for entry in content:
+        if not isinstance(entry, dict):
+            continue
+        words = entry.get("text") or []
+        # Each word entry: {text, timestamp, endtime}
+        text_join = " ".join(
+            (w.get("text") or "").strip()
+            for w in words
+            if isinstance(w, dict) and (w.get("text") or "").strip()
+        ).strip()
+        if not text_join:
+            continue
+        start_ms = entry.get("timestamp")
+        start = float(start_ms) / 1000.0 if isinstance(start_ms, (int, float)) else None
+        line = {"start": start, "text": text_join}
+        end_ms = entry.get("endtime")
+        if isinstance(end_ms, (int, float)):
+            line["end"] = float(end_ms) / 1000.0
+
+        # Attach word-level parts only when each word has its own timing
+        # (i.e. type == "Syllable"). Skipped for "Line" / "None".
+        if kind == "Syllable":
+            parts = []
+            for w in words:
+                if not isinstance(w, dict):
+                    continue
+                wt = (w.get("text") or "").strip()
+                if not wt:
+                    continue
+                ws = w.get("timestamp")
+                we = w.get("endtime")
+                if isinstance(ws, (int, float)):
+                    parts.append({
+                        "start": float(ws) / 1000.0,
+                        "end": float(we) / 1000.0 if isinstance(we, (int, float)) else None,
+                        "text": wt,
+                    })
+            if parts:
+                line["parts"] = parts
+        lines.append(line)
+
+    if not lines:
+        return None
+    synced = all(l.get("start") is not None for l in lines)
+    # type=="None" → plain text only; we already drop "synced" when starts are missing
+    if kind == "None":
+        # Strip timings so the chain ranks this as plain (rank 1) — Apple's
+        # "no timing" tracks shouldn't preempt a line-synced source.
+        for l in lines:
+            l["start"] = None
+        synced = False
+    return {
+        "lines": lines,
+        "synced": synced,
+        "source": "Apple Music",
+    }
+
+
+def _strip_leading_credits(lines):
+    """Drop the production-credit lines that NetEase and a few other
+    sources prepend to their LRC (e.g. ``作词 : X`` / ``Lyricist: X``).
+    Only strips contiguously from the start so a credit-shaped lyric in
+    the middle of the song stays put."""
+    credit_keywords = (
+        "作词", "作曲", "编曲", "編曲", "制作人", "製作人", "出品人",
+        "混音", "母带", "監製", "监制", "演唱", "和声", "录音",
+        "lyricist", "composer", "arranger", "producer", "mixed by",
+    )
+    out = []
+    skipping = True
+    for line in lines:
+        text = (line.get("text") or "").strip()
+        if skipping:
+            text_low = text.lower()
+            looks_like_credit = (":" in text or "：" in text) and any(
+                kw in text_low for kw in credit_keywords
+            )
+            if looks_like_credit:
+                continue
+            skipping = False
+        out.append(line)
+    return out
+
+
+def _parse_lrc_text(lrc_string):
+    """Parse an LRC string ([mm:ss.xx] text) into our normalized line list.
+
+    LRCLIB returns standard line-timed LRC. Each line may carry one or more
+    ``[mm:ss.xx]`` timestamps followed by the lyric text; instrumental
+    sections show up as empty-text timestamps which we keep so the active
+    line still advances during those gaps."""
+    import re
+
+    if not lrc_string:
+        return []
+
+    timestamp_re = re.compile(r"\[(\d+):(\d{1,2})(?:[.:](\d{1,3}))?\]")
+    out = []
+    for raw_line in lrc_string.splitlines():
+        # Collect all timestamps at the start of the line.
+        starts = []
+        idx = 0
+        while True:
+            m = timestamp_re.match(raw_line, idx)
+            if not m:
+                break
+            minutes = int(m.group(1))
+            seconds = int(m.group(2))
+            frac = m.group(3)
+            frac_s = float("0." + frac) if frac else 0.0
+            starts.append(minutes * 60 + seconds + frac_s)
+            idx = m.end()
+        if not starts:
+            # LRC metadata tags like [ar:...] / [ti:...] / [length:...] also
+            # match the bracket pattern but aren't actual timestamps; skip
+            # any line without a numeric timestamp.
+            continue
+        text = raw_line[idx:].strip()
+        for start in starts:
+            out.append({"start": start, "text": text})
+    # LRC repeats can be in any order; sort by start time.
+    out.sort(key=lambda l: l["start"])
+    return out
+
+
+def _ttml_to_lines(ttml_string):
+    """Turn a BetterLyrics TTML payload into our normalized line list.
+
+    Each line carries a start time and the full text. When the TTML has
+    word-level ``<span>`` children with their own ``begin``/``end``, we
+    also attach a ``parts`` list of ``{start, end, text}`` so the UI can
+    do karaoke-style per-word highlighting.
+    """
+    import xml.etree.ElementTree as ET
+
+    try:
+        root = ET.fromstring(ttml_string)
+    except ET.ParseError as e:
+        print(f"[LYRICS] TTML parse failed: {e}")
+        return []
+
+    def _local(tag):
+        return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+    lines = []
+    for elem in root.iter():
+        if _local(elem.tag) != "p":
+            continue
+        line_start = _ttml_time_to_seconds(elem.get("begin"))
+        line_end = _ttml_time_to_seconds(elem.get("end"))
+
+        # Walk direct children to preserve order. Each <span> with begin/end
+        # is a word. Any text outside spans is treated as filler.
+        parts = []
+        text_chunks = []
+        if elem.text:
+            text_chunks.append(elem.text)
+        for child in list(elem):
+            if _local(child.tag) == "span":
+                word = (child.text or "").strip()
+                if word:
+                    w_start = _ttml_time_to_seconds(child.get("begin"))
+                    w_end = _ttml_time_to_seconds(child.get("end"))
+                    parts.append({"start": w_start, "end": w_end, "text": word})
+                    text_chunks.append(word)
+            elif child.text:
+                text_chunks.append(child.text)
+            if child.tail:
+                text_chunks.append(child.tail)
+
+        text = " ".join(("".join(text_chunks)).split())
+        if not text:
+            continue
+
+        line = {"start": line_start, "text": text}
+        if line_end is not None:
+            line["end"] = line_end
+        # Only attach parts if at least one had real timing data — otherwise
+        # the UI falls back to line-level rendering.
+        if any(p.get("start") is not None for p in parts):
+            line["parts"] = parts
+        lines.append(line)
+    return lines
+
+
 class MusicClient:
     _instance = None
 
@@ -802,13 +1133,51 @@ class MusicClient:
                     return cached
             return []
 
-    def is_in_library(self, playlist_id):
-        """Check if a playlist or album is saved in the user's library."""
+    def is_in_library(self, playlist_id, on_cache_warmed=None):
+        """Check if a playlist or album is saved. NEVER blocks on network.
+
+        Previously this fetched library playlists + albums synchronously on
+        first call. That ran inside update_ui on the main thread, so a cold
+        playlist open hit two YT requests on the UI thread — fine online,
+        but a 30+ second TCP-timeout freeze with wifi off. Now we only
+        consult the in-memory cache; if it's cold, we kick off a background
+        populate and (optionally) invoke ``on_cache_warmed`` on the main
+        thread when it lands, so the caller can re-check and refresh UI.
+        """
         if not playlist_id or not self.is_authenticated():
             return False
 
-        # Fetch library data if not cached yet
-        if not self._library_playlist_ids:
+        if not self._library_playlist_ids and not self._library_album_ids:
+            self._populate_library_cache_async(on_cache_warmed)
+            return False  # optimistic; corrected when populate completes
+
+        pid = playlist_id
+        if pid.startswith("VL"):
+            pid = pid[2:]
+        if pid in self._library_playlist_ids:
+            return True
+        if pid in self._library_album_ids:
+            return True
+        return False
+
+    def _populate_library_cache_async(self, on_complete=None):
+        """Fill ``_library_playlist_ids`` / ``_library_album_ids`` on a
+        worker thread. Coalesces overlapping calls; ``on_complete`` (if
+        given) fires on the main thread once the cache is warm."""
+        import threading as _t
+        if not hasattr(self, "_library_populate_lock"):
+            self._library_populate_lock = _t.Lock()
+            self._library_populate_in_flight = False
+            self._library_populate_callbacks = []
+
+        with self._library_populate_lock:
+            if on_complete is not None:
+                self._library_populate_callbacks.append(on_complete)
+            if self._library_populate_in_flight:
+                return
+            self._library_populate_in_flight = True
+
+        def _populate():
             try:
                 playlists = self.api.get_library_playlists()
                 self._library_playlists = playlists
@@ -817,30 +1186,34 @@ class MusicClient:
                 }
             except Exception:
                 pass
-        if not self._library_album_ids:
             try:
                 albums = self.api.get_library_albums(limit=100)
-                self._library_album_ids = set()
+                ids = set()
                 for a in albums:
                     if a.get("browseId"):
-                        self._library_album_ids.add(a["browseId"])
+                        ids.add(a["browseId"])
                     if a.get("audioPlaylistId"):
-                        self._library_album_ids.add(a["audioPlaylistId"])
+                        ids.add(a["audioPlaylistId"])
                     if a.get("playlistId"):
-                        self._library_album_ids.add(a["playlistId"])
+                        ids.add(a["playlistId"])
+                self._library_album_ids = ids
             except Exception:
                 pass
 
-        pid = playlist_id
-        if pid.startswith("VL"):
-            pid = pid[2:]
-        # Check playlists
-        if pid in self._library_playlist_ids:
-            return True
-        # Check albums (by browseId, audioPlaylistId, or playlistId)
-        if pid in self._library_album_ids:
-            return True
-        return False
+            with self._library_populate_lock:
+                callbacks = list(self._library_populate_callbacks)
+                self._library_populate_callbacks.clear()
+                self._library_populate_in_flight = False
+
+            if callbacks:
+                try:
+                    from gi.repository import GLib
+                    for cb in callbacks:
+                        GLib.idle_add(cb)
+                except Exception:
+                    pass
+
+        _t.Thread(target=_populate, daemon=True).start()
 
     def rate_playlist(self, playlist_id, rating="LIKE"):
         """Rate a playlist/album: 'LIKE' to save, 'INDIFFERENT' to remove from library.
@@ -1103,7 +1476,15 @@ class MusicClient:
                     "thumbnails": result.get("thumbnails", []) or [],
                     "author_raw": raw_author if isinstance(raw_author, (dict, list)) else None,
                 }
-                self._offline_db.cache_playlist(
+                # Defer the cache write off the critical path. It's a
+                # ``json.dumps(tracks)`` over ~1000 dicts (200-500 KB),
+                # plus a second ``json.loads`` for the regression check —
+                # all running under the GIL and visibly stalling the UI
+                # thread during playlist open (~100-200 ms blocked frames).
+                # The cache is a next-time optimization, not a correctness
+                # requirement; it can wait a couple of seconds for the
+                # page to finish rendering.
+                self._schedule_playlist_cache_write(
                     playlist_id,
                     result.get("title", ""),
                     author_str,
@@ -1133,6 +1514,852 @@ class MusicClient:
         except Exception as e:
             print(f"Error getting watch playlist: {e}")
             return {}
+
+    # Provider catalog — display name -> (fetcher, takes_video_id_only).
+    # Listed in the order we try them in the chain.
+    _LYRIC_PROVIDERS = [
+        ("Apple Music", "_fetch_lyrics_paxsenix", False),
+        ("BetterLyrics",           "_fetch_lyrics_betterlyrics", False),
+        ("BiniLyrics",             "_fetch_lyrics_binilyrics", False),
+        ("NetEase",                "_fetch_lyrics_netease", False),
+        ("LRCLIB",                 "_fetch_lyrics_lrclib", False),
+        ("YouTube Music",          "_fetch_lyrics_ytm", True),
+    ]
+
+    @property
+    def _lyrics_cache(self):
+        cache = getattr(self, "_lyrics_cache_inst", None)
+        if cache is None:
+            from player.lyrics_cache import LyricsCache
+            cache = LyricsCache()
+            self._lyrics_cache_inst = cache
+        return cache
+
+    def get_lyrics(self, video_id, title=None, artist=None, duration=None):
+        """Return the lyrics for a track as a normalized dict, or
+        ``None`` if nothing was found. Reads the disk cache first
+        (instant), then runs the provider chain on miss and caches what
+        it finds. The user can pin a particular provider for a track
+        via :meth:`set_preferred_lyrics_source`; when a preference
+        exists the cache returns that instead of the ranking-chosen
+        best.
+
+            {
+                "lines": [{"start": float_seconds_or_None, "text": str,
+                           "parts": [{...}]?}, ...],
+                "synced": bool,   # True iff every line has a real start time
+                "source": str,    # human-readable provider name
+            }
+        """
+        if not video_id:
+            return None
+
+        cached = self._lyrics_cache.get_result(video_id)
+        if cached:
+            return cached
+
+        result = self._run_lyrics_chain(video_id, title, artist, duration)
+        if result:
+            self._lyrics_cache.add_result(video_id, result)
+        return result
+
+    def get_lyrics_alternatives(self, video_id):
+        """Return ``[(source_name, result), ...]`` for every provider we
+        already have cached for this video. Ordered richest-first. Use
+        :meth:`fetch_lyrics_alternatives_async` to populate uncached
+        providers."""
+        return self._lyrics_cache.get_alternatives(video_id)
+
+    def get_preferred_lyrics_source(self, video_id):
+        """The user-pinned provider for this track, or ``None`` if none."""
+        return self._lyrics_cache.get_preferred(video_id)
+
+    def set_preferred_lyrics_source(self, video_id, source):
+        """Pin ``source`` (one of the provider display names) as the
+        result the next :meth:`get_lyrics` call should return for this
+        track. Pass ``None`` to clear the preference."""
+        self._lyrics_cache.set_preferred(video_id, source)
+
+    def fetch_lyrics_alternatives_async(
+        self, video_id, title, artist, duration, on_result,
+    ):
+        """Fire every provider in parallel (on background threads) and
+        call ``on_result(source_name, result_or_None)`` for each as it
+        completes. Cache hits emit synchronously before the function
+        returns. ``on_result`` is called from worker threads — wrap any
+        UI work in ``GLib.idle_add``."""
+        import threading
+
+        if not video_id:
+            return
+        title_variants = _title_variants(title) if title else []
+
+        # Emit anything we already have cached up-front.
+        for src, res in self._lyrics_cache.get_alternatives(video_id):
+            on_result(src, res)
+
+        cached_sources = {
+            src for src, _ in self._lyrics_cache.get_alternatives(video_id)
+        }
+
+        def _runner(source_name, fetcher_attr, takes_vid_only):
+            try:
+                fetcher = getattr(self, fetcher_attr)
+                if takes_vid_only:
+                    res = fetcher(video_id)
+                else:
+                    res = None
+                    for variant in title_variants:
+                        res = fetcher(variant, artist, duration)
+                        if res:
+                            break
+                if res:
+                    # Make sure the result's source label matches the
+                    # display name, since some fetchers carry a more
+                    # specific string (e.g. "BetterLyrics").
+                    res = dict(res)
+                    res["source"] = source_name
+                    self._lyrics_cache.add_result(video_id, res)
+            except Exception as e:
+                print(f"[LYRICS] alt-fetch {source_name} failed: {e}")
+                res = None
+            on_result(source_name, res)
+
+        for source_name, fetcher_attr, takes_vid_only in self._LYRIC_PROVIDERS:
+            if source_name in cached_sources:
+                continue
+            t = threading.Thread(
+                target=_runner,
+                args=(source_name, fetcher_attr, takes_vid_only),
+                daemon=True,
+            )
+            t.start()
+
+    def _run_lyrics_chain(self, video_id, title, artist, duration):
+        """Walk the provider chain in priority order, returning the
+        richest result we can find. Word-level providers go first;
+        line-synced next; plain text last. ``rank`` encodes the order:
+        3=word, 2=line-synced, 1=plain.
+
+        YouTube Music titles for international tracks frequently arrive
+        as ``Original - Translation`` (e.g. ``イガク - Medicine``) or
+        carry ``(feat. X)`` / ``(Remastered)`` suffixes that don't match
+        the canonical title in lyrics DBs. We try a few normalized
+        variants so a single source dropout doesn't lose us the song.
+        """
+        title_variants = _title_variants(title) if title else []
+
+        result = None
+        best_rank = 0
+
+        for fetcher, args_list, target_rank in [
+            (self._fetch_lyrics_paxsenix,
+             [(v, artist, duration) for v in title_variants], 3),
+            (self._fetch_lyrics_betterlyrics,
+             [(v, artist, duration) for v in title_variants], 3),
+            (self._fetch_lyrics_binilyrics,
+             [(v, artist, duration) for v in title_variants], 3),
+            (self._fetch_lyrics_netease,
+             [(v, artist, duration) for v in title_variants], 2),
+            (self._fetch_lyrics_lrclib,
+             [(v, artist, duration) for v in title_variants], 2),
+            (self._fetch_lyrics_ytm, [(video_id,)], 1),
+        ]:
+            if best_rank >= target_rank:
+                continue
+            for args in args_list:
+                res = fetcher(*args)
+                rank = _result_rank(res)
+                if rank > best_rank:
+                    result = res
+                    best_rank = rank
+                if best_rank >= target_rank:
+                    break
+
+        return result
+
+    def _fetch_lyrics_binilyrics(self, title, artist, duration):
+        """Query BiniLyrics (https://lyrics-api.binimum.org/) — an open
+        TTML database used by the BetterLyrics extension that has good
+        word-level coverage for English/Western pop and Japanese tracks.
+
+        The endpoint takes a free-text query, returns a list of matches
+        with ISRC + timing_type, and a ``lyricsUrl`` pointing at TTML on
+        their static-storage subdomain."""
+        import urllib.parse
+        import urllib.request
+        import urllib.error
+        import json as _json
+
+        headers = {"User-Agent": "BetterLyrics/1.0"}
+
+        # Search by "title artist" — exact match isn't required, the
+        # backend does fuzzy lookup.
+        query = title.strip() + (" " + artist.strip() if artist else "")
+        search_url = (
+            "https://lyrics-api.binimum.org/getLyrics?"
+            + urllib.parse.urlencode({"q": query})
+        )
+        try:
+            req = urllib.request.Request(search_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                print(f"[LYRICS] BiniLyrics HTTP {e.code}: {e.reason}")
+            return None
+        except Exception as e:
+            print(f"[LYRICS] BiniLyrics search failed: {e}")
+            return None
+
+        try:
+            data = _json.loads(body)
+        except _json.JSONDecodeError:
+            return None
+        results = (data.get("results") if isinstance(data, dict) else None) or []
+        if not results:
+            return None
+
+        # Hard-filter to artist matches before scoring — keeps "Intro" from
+        # one album from claiming to be lyrics for an entirely unrelated
+        # track that happens to share the name.
+        if artist:
+            artist_filtered = [
+                r for r in results
+                if _artist_matches(artist, r.get("artist_name") or "")
+            ]
+            if artist_filtered:
+                results = artist_filtered
+            elif _is_generic_title(title):
+                return None
+
+        # Score: prefer results with word-level timing, then by duration
+        # closeness (within 5 s).
+        def _score(item):
+            r = 0
+            if item.get("timing_type") in ("word", "syllable"):
+                r += 100
+            d = item.get("duration") or 0
+            if duration and d:
+                r -= min(abs(int(duration) - int(d)), 30)
+            return -r
+        results.sort(key=_score)
+        best = results[0]
+
+        lyrics_url = best.get("lyricsUrl")
+        if not lyrics_url:
+            return None
+        try:
+            req = urllib.request.Request(lyrics_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                ttml = resp.read().decode("utf-8", errors="replace")
+        except Exception as e:
+            print(f"[LYRICS] BiniLyrics ttml fetch failed: {e}")
+            return None
+
+        lines = _ttml_to_lines(ttml)
+        if not lines:
+            return None
+        synced = all(l.get("start") is not None for l in lines)
+        # If the search promised word-level but the parsed TTML doesn't
+        # have any parts, fall through — line-synced LRCLIB will likely
+        # be a better match.
+        has_parts = any(l.get("parts") for l in lines)
+        if best.get("timing_type") in ("word", "syllable") and not has_parts:
+            return None
+        if not synced and not has_parts:
+            # Unsynced plain TTML — let the line-synced providers try first;
+            # we'll only fall back to this if everything else misses.
+            return {"lines": lines, "synced": False, "source": "BiniLyrics"}
+        return {"lines": lines, "synced": synced, "source": "BiniLyrics"}
+
+    def _fetch_lyrics_netease(self, title, artist, duration):
+        """Query NetEase Music (music.163.com) — by far the broadest
+        source for Japanese, Vocaloid, K-pop, and other Asian tracks.
+        Uses the unencrypted ``cloudsearch/pc`` search endpoint and the
+        ``song/lyric`` lyric endpoint, both of which return plain JSON
+        with no auth required."""
+        import urllib.parse
+        import urllib.request
+        import urllib.error
+        import json as _json
+
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://music.163.com/",
+        }
+
+        # 1. Search for the track. The `cloudsearch/pc` variant returns
+        # unencrypted JSON (unlike the regular `cloudsearch/get/web` one).
+        query = title.strip() + (" " + artist.strip() if artist else "")
+        try:
+            search_url = (
+                "https://music.163.com/api/cloudsearch/pc?"
+                + urllib.parse.urlencode({
+                    "s": query, "type": 1, "limit": 8, "offset": 0,
+                })
+            )
+            req = urllib.request.Request(search_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                search_body = resp.read().decode("utf-8", errors="replace")
+        except Exception as e:
+            print(f"[LYRICS] NetEase search failed: {e}")
+            return None
+
+        try:
+            search_data = _json.loads(search_body)
+        except _json.JSONDecodeError:
+            return None
+        songs = (
+            (search_data.get("result") or {}).get("songs") or []
+            if isinstance(search_data, dict) else []
+        )
+        if not songs:
+            return None
+
+        # 2. Hard-filter to artist matches first. For generic titles like
+        # "Intro" the closest-duration tiebreaker is a coin toss across
+        # whoever else has an Intro track on NetEase — artist mismatch
+        # has to disqualify the result, not just dock its score.
+        if artist:
+            artist_filtered = []
+            for song in songs:
+                song_artists = " ".join(
+                    (a.get("name") or "")
+                    for a in (song.get("ar") or [])
+                )
+                if _artist_matches(artist, song_artists):
+                    artist_filtered.append(song)
+            if artist_filtered:
+                songs = artist_filtered
+            elif _is_generic_title(title):
+                # Generic title + no artist match = certain false positive.
+                # Better to return nothing than wrong lyrics.
+                return None
+
+        # 3. Pick the best match: closest duration wins, with a small
+        # bonus for exact-title match.
+        title_low = title.lower().strip()
+
+        def _score(song):
+            score = 0
+            # NetEase returns duration in ms (the `dt` field).
+            d_ms = song.get("dt") or 0
+            if duration and d_ms:
+                delta = abs(int(duration) - (d_ms // 1000))
+                score -= min(delta, 30)
+            name = (song.get("name") or "").lower()
+            if title_low and (title_low in name or name in title_low):
+                score += 5
+            return -score
+        songs.sort(key=_score)
+        best = songs[0]
+        song_id = best.get("id")
+        if not song_id:
+            return None
+
+        # 3. Fetch the lyric. NetEase returns an LRC string in
+        # `result.lrc.lyric` — exactly the format our LRC parser
+        # already understands.
+        try:
+            lyric_url = (
+                f"https://music.163.com/api/song/lyric?id={song_id}"
+                "&lv=1&kv=1&tv=-1"
+            )
+            req = urllib.request.Request(lyric_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                lyric_body = resp.read().decode("utf-8", errors="replace")
+        except Exception as e:
+            print(f"[LYRICS] NetEase lyric fetch failed: {e}")
+            return None
+
+        try:
+            lyric_data = _json.loads(lyric_body)
+        except _json.JSONDecodeError:
+            return None
+        lrc = ((lyric_data.get("lrc") or {}).get("lyric") or "").strip() \
+            if isinstance(lyric_data, dict) else ""
+        if not lrc:
+            return None
+
+        lines = _parse_lrc_text(lrc)
+        if not lines:
+            return None
+        # NetEase usually pads the start with credit metadata (e.g.
+        # ``[00:00.000] 作词 : XXX``, ``[00:01.000] 作曲 : XXX``). Strip
+        # those leading credit lines so the lyrics column doesn't open on
+        # production notes instead of the actual song.
+        lines = _strip_leading_credits(lines)
+        if not lines:
+            return None
+        synced = all(l.get("start") is not None for l in lines)
+        return {"lines": lines, "synced": synced, "source": "NetEase"}
+
+    def _fetch_lyrics_lrclib(self, title, artist, duration):
+        """Query LRCLIB (https://lrclib.net) for synced LRC. Tries the exact
+        ``/get`` endpoint first (matches by title + artist + duration ±2 s);
+        if that misses, falls back to ``/get`` without duration and then to
+        ``/search`` so a minor metadata mismatch (e.g. a (Remastered) suffix
+        or a duration off by a few seconds) doesn't lose us the lyrics."""
+        import urllib.parse
+        import urllib.request
+        import urllib.error
+        import json as _json
+
+        headers = {"User-Agent": "Mixtapes (https://github.com/m-obeid/Mixtapes)"}
+
+        def _hit(path, params):
+            url = "https://lrclib.net/api/" + path + "?" + urllib.parse.urlencode(params)
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                # 3 s is enough for a successful hit; capping low here keeps
+                # the worst case at a few seconds when the chain has to try
+                # multiple title variants and the API is sluggish.
+                with urllib.request.urlopen(req, timeout=3) as resp:
+                    return _json.loads(resp.read())
+            except urllib.error.HTTPError as e:
+                if e.code != 404:
+                    print(f"[LYRICS] LRCLIB HTTP {e.code}: {e.reason} for {path}")
+                return None
+            except Exception as e:
+                print(f"[LYRICS] LRCLIB fetch failed: {e}")
+                return None
+
+        candidates = []
+        base = {"track_name": title, "artist_name": artist}
+        if duration and duration > 0:
+            data = _hit("get", {**base, "duration": int(duration)})
+            if isinstance(data, dict):
+                candidates.append(data)
+        data = _hit("get", base)
+        if isinstance(data, dict):
+            candidates.append(data)
+        if not candidates:
+            results = _hit("search", base)
+            if isinstance(results, list) and results:
+                # Filter to results whose artist matches ours. Without this
+                # an unfilled exact-match request followed by /search would
+                # happily return some random album's "Intro" lyrics for any
+                # track called "Intro" — the closest-duration tiebreaker
+                # gives the wrong answer immediately.
+                if artist:
+                    results = [
+                        r for r in results
+                        if _artist_matches(artist, r.get("artistName") or "")
+                    ]
+                if results:
+                    def _score(item):
+                        d = item.get("duration") or 0
+                        return abs((duration or 0) - d) if duration else 0
+                    results.sort(key=_score)
+                    candidates.append(results[0])
+
+        for cand in candidates:
+            synced = cand.get("syncedLyrics")
+            plain = cand.get("plainLyrics")
+            if synced and isinstance(synced, str) and synced.strip():
+                lines = _parse_lrc_text(synced)
+                if lines:
+                    return {
+                        "lines": lines,
+                        "synced": all(l.get("start") is not None for l in lines),
+                        "source": "LRCLIB",
+                    }
+            if plain and isinstance(plain, str) and plain.strip():
+                lines = [
+                    {"start": None, "text": ln.strip()}
+                    for ln in plain.splitlines()
+                    if ln.strip()
+                ]
+                if lines:
+                    return {
+                        "lines": lines,
+                        "synced": False,
+                        "source": "LRCLIB",
+                    }
+        return None
+
+    def _fetch_lyrics_paxsenix(self, title, artist, duration):
+        """Query the Paxsenix proxy (``lyrics.paxsenix.org``) which
+        re-serves Apple Music's lyric database. Apple Music ships
+        syllable-level timing for an enormous chunk of Western pop, and
+        Paxsenix's ``/apple-music/lyrics`` endpoint returns it as plain
+        JSON keyed by Apple Music's catalog song ID.
+
+        We have to scrape an Apple Music developer token from the Apple
+        Music web app (the same trick Metrolist uses) to do the catalog
+        search. The token is cached process-wide and re-fetched only
+        when Apple Music returns 401."""
+        import urllib.parse
+        import urllib.request
+        import urllib.error
+        import json as _json
+
+        # 1. Apple Music search for matching tracks.
+        token = self._apple_music_token(force_new=False)
+        songs = self._apple_music_search(token, title, artist) if token else None
+        if songs is None and token:
+            # The token might have expired; try once with a fresh one.
+            token = self._apple_music_token(force_new=True)
+            songs = self._apple_music_search(token, title, artist) if token else None
+        if not songs:
+            return None
+
+        # 2. Hard-filter to artist matches. Generic-title tracks would
+        # otherwise pick up Apple Music's "Intro" by anyone with the
+        # closest duration.
+        if artist:
+            artist_filtered = [
+                s for s in songs
+                if _artist_matches(
+                    artist,
+                    (s.get("attributes") or {}).get("artistName") or "",
+                )
+            ]
+            if artist_filtered:
+                songs = artist_filtered
+            elif _is_generic_title(title):
+                return None
+
+        # 3. Score candidates by duration + name match.
+        title_low = title.lower().strip()
+
+        def _score(song):
+            attr = song.get("attributes") or {}
+            score = 0
+            d_ms = attr.get("durationInMillis") or 0
+            if duration and d_ms:
+                delta = abs(int(duration) - (d_ms // 1000))
+                if delta <= 2:
+                    score += 100
+                elif delta <= 5:
+                    score += 50
+                elif delta <= 10:
+                    score += 10
+                else:
+                    score -= 50
+            name_low = (attr.get("name") or "").lower()
+            if title_low and (title_low == name_low):
+                score += 80
+            elif title_low and (title_low in name_low or name_low in title_low):
+                score += 40
+            return -score
+        songs.sort(key=_score)
+
+        # 3. Walk the top few matches looking for the richest lyric type.
+        best = None
+        best_rank = 0
+        for song in songs[:5]:
+            data = self._paxsenix_fetch(song.get("id"))
+            if not data:
+                continue
+            res = _paxsenix_to_lines(data)
+            if res is None:
+                continue
+            rank = _result_rank(res)
+            if rank > best_rank:
+                best = res
+                best_rank = rank
+            if best_rank >= 3:
+                break
+        return best
+
+    def _apple_music_token(self, force_new=False):
+        """Scrape an Apple Music JWT from the Apple Music web app and
+        cache it process-wide. Used to authorize catalog search calls."""
+        import urllib.request
+        import re as _re
+
+        if not force_new:
+            tok = getattr(self, "_am_token", None)
+            if tok:
+                return tok
+
+        try:
+            req = urllib.request.Request(
+                "https://beta.music.apple.com",
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                main_html = resp.read().decode("utf-8", errors="replace")
+            m = _re.search(r"/assets/index[~\-][^/\"' ]+\.js", main_html)
+            if not m:
+                print("[LYRICS] Paxsenix: couldn't locate Apple Music bundle")
+                return None
+            js_url = "https://beta.music.apple.com" + m.group(0)
+            req = urllib.request.Request(
+                js_url, headers={"User-Agent": "Mozilla/5.0"},
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                js_body = resp.read().decode("utf-8", errors="replace")
+            tok_match = _re.search(r"eyJh[A-Za-z0-9._-]+", js_body)
+            if not tok_match:
+                print("[LYRICS] Paxsenix: couldn't extract Apple Music token")
+                return None
+            tok = tok_match.group(0)
+            self._am_token = tok
+            return tok
+        except Exception as e:
+            print(f"[LYRICS] Paxsenix: token fetch failed: {e}")
+            return None
+
+    def _apple_music_search(self, token, title, artist):
+        import urllib.parse
+        import urllib.request
+        import urllib.error
+        import json as _json
+
+        if not token:
+            return None
+        term = title.strip() + (" " + artist.strip() if artist else "")
+        url = (
+            "https://amp-api.music.apple.com/v1/catalog/us/search?"
+            + urllib.parse.urlencode({
+                "term": term, "types": "songs", "limit": 8,
+                "l": "en-US", "platform": "web",
+            })
+        )
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Origin": "https://music.apple.com",
+            "Referer": "https://music.apple.com/",
+            "User-Agent": "Mozilla/5.0",
+        }
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                data = _json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                # Caller will retry with a freshly-scraped token.
+                self._am_token = None
+                return None
+            print(f"[LYRICS] Apple Music search HTTP {e.code}")
+            return None
+        except Exception as e:
+            print(f"[LYRICS] Apple Music search failed: {e}")
+            return None
+        return (
+            (data.get("results") or {}).get("songs", {}).get("data") or []
+            if isinstance(data, dict) else []
+        )
+
+    def _paxsenix_fetch(self, song_id):
+        import urllib.request
+        import json as _json
+        if not song_id:
+            return None
+        try:
+            url = f"https://lyrics.paxsenix.org/apple-music/lyrics?id={song_id}"
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "Mixtapes/1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                return _json.loads(resp.read())
+        except Exception as e:
+            print(f"[LYRICS] Paxsenix lyric fetch failed: {e}")
+            return None
+
+    def _fetch_lyrics_betterlyrics(self, title, artist, duration):
+        import urllib.parse
+        import urllib.request
+        import json as _json
+
+        # BetterLyrics' response is just the lyric body — no artist field
+        # to verify against. If our title is generic ("Intro" etc.) and
+        # the server's fuzzy match goes wide, we'd silently return a
+        # totally different track's lyrics. Skip rather than risk it;
+        # Paxsenix (also Apple Music-backed) covers the same source and
+        # we *do* check artist there.
+        if _is_generic_title(title) and artist:
+            return None
+
+        params = {"s": title, "a": artist}
+        if duration and duration > 0:
+            params["d"] = str(int(duration))
+        url = (
+            "https://lyrics-api.boidu.dev/getLyrics?"
+            + urllib.parse.urlencode(params)
+        )
+        # The endpoint returns 403 to generic user agents — the BetterLyrics
+        # browser extension identifies itself this way and the API mirrors
+        # that as a soft gate.
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "BetterLyrics/1.0"}
+            )
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            # 401/404 just mean "no lyrics for this track" — common and
+            # not actionable. Anything else (5xx, timeout) is worth logging.
+            if e.code not in (401, 404):
+                print(f"[LYRICS] BetterLyrics HTTP {e.code}: {e.reason}")
+            return None
+        except Exception as e:
+            print(f"[LYRICS] BetterLyrics fetch failed: {e}")
+            return None
+
+        try:
+            data = _json.loads(body)
+        except _json.JSONDecodeError:
+            return None
+
+        # Newer responses are wrapped as {"ttml": "<tt …>…</tt>"} — Apple
+        # Music's TTML schema with word-level <span> timing. Older shapes
+        # are kept as a fallback in case the deployment ever rolls back.
+        if isinstance(data, dict) and isinstance(data.get("ttml"), str):
+            lines = _ttml_to_lines(data["ttml"])
+            if lines:
+                synced = all(l.get("start") is not None for l in lines)
+                return {
+                    "lines": lines,
+                    "synced": synced,
+                    "source": "BetterLyrics",
+                }
+            return None
+
+        raw_lines = data.get("lyrics") if isinstance(data, dict) else data
+        if not isinstance(raw_lines, list) or not raw_lines:
+            return None
+
+        lines = []
+        synced = True
+        for item in raw_lines:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("words") or item.get("text") or ""
+            text = str(text).strip()
+            if not text:
+                continue
+            start_ms = item.get("startTimeMs")
+            start = None
+            try:
+                if start_ms is not None:
+                    start = float(start_ms) / 1000.0
+            except (TypeError, ValueError):
+                start = None
+            if start is None:
+                synced = False
+            lines.append({"start": start, "text": text})
+
+        if not lines:
+            return None
+        return {"lines": lines, "synced": synced, "source": "BetterLyrics"}
+
+    def _fetch_lyrics_ytm(self, video_id):
+        if not self.api:
+            return None
+        try:
+            wp = self.api.get_watch_playlist(videoId=video_id, limit=1)
+        except Exception as e:
+            print(f"[LYRICS] watch_playlist failed: {e}")
+            return None
+        browse_id = wp.get("lyrics") if isinstance(wp, dict) else None
+        if not browse_id:
+            return None
+
+        # Try timed lyrics first; older ytmusicapi releases don't accept
+        # the kwarg, so silently fall back to plain text on TypeError.
+        data = None
+        try:
+            data = self.api.get_lyrics(browse_id, timestamps=True)
+        except TypeError:
+            try:
+                data = self.api.get_lyrics(browse_id)
+            except Exception as e:
+                print(f"[LYRICS] get_lyrics failed: {e}")
+                return None
+        except Exception as e:
+            print(f"[LYRICS] get_lyrics(timestamps) failed: {e}")
+            try:
+                data = self.api.get_lyrics(browse_id)
+            except Exception as e2:
+                print(f"[LYRICS] get_lyrics fallback failed: {e2}")
+                return None
+
+        if not data:
+            return None
+
+        raw = data.get("lyrics")
+        source = (data.get("source") or "YouTube Music").replace("Source: ", "")
+        if data.get("hasTimestamps") and isinstance(raw, list):
+            lines = []
+            for ll in raw:
+                # LyricLine: attribute access on the dataclass; fall back to
+                # dict access in case ytmusicapi changes the type.
+                text = getattr(ll, "text", None) or (
+                    ll.get("text") if isinstance(ll, dict) else None
+                )
+                start_ms = getattr(ll, "start_time", None)
+                if start_ms is None and isinstance(ll, dict):
+                    start_ms = ll.get("start_time")
+                if not text:
+                    continue
+                start = None
+                try:
+                    if start_ms is not None:
+                        start = float(start_ms) / 1000.0
+                except (TypeError, ValueError):
+                    start = None
+                lines.append({"start": start, "text": str(text).strip()})
+            if not lines:
+                return None
+            return {"lines": lines, "synced": True, "source": source}
+
+        # Plain text fallback — split on newlines, no timing.
+        if isinstance(raw, str) and raw.strip():
+            lines = [
+                {"start": None, "text": ln.strip()}
+                for ln in raw.splitlines()
+                if ln.strip()
+            ]
+            if not lines:
+                return None
+            return {"lines": lines, "synced": False, "source": source}
+
+        return None
+
+    def _schedule_playlist_cache_write(
+        self, playlist_id, title, author, track_count, tracks, meta
+    ):
+        """Write the playlist into the on-disk cache on a low-priority
+        thread after a delay. The serialization (``json.dumps`` over
+        ~1000 track dicts) holds the GIL for hundreds of milliseconds,
+        which stalls UI binds when it runs on the same fetch thread
+        right after the API call returns. Doing it later means the page
+        finishes rendering first.
+
+        Also de-duplicates rapid back-to-back writes for the same
+        playlist (e.g. cache-then-live fetches) — the latest call wins.
+        """
+        import threading as _t
+
+        pending = getattr(self, "_pending_cache_writes", None)
+        if pending is None:
+            pending = {}
+            self._pending_cache_writes = pending
+            self._pending_cache_lock = _t.Lock()
+
+        with self._pending_cache_lock:
+            pending[playlist_id] = (
+                title, author, track_count, tracks, meta,
+            )
+
+        def _worker(pid):
+            import time as _time
+            _time.sleep(1.5)  # let the page render before grabbing the GIL
+            with self._pending_cache_lock:
+                args = self._pending_cache_writes.pop(pid, None)
+            if not args or not self._offline_db:
+                return
+            t, a, tc, tr, m = args
+            try:
+                self._offline_db.cache_playlist(pid, t, a, tc, tr, m)
+            except Exception as e:
+                print(f"[CACHE] deferred playlist write failed: {e}")
+
+        _t.Thread(target=_worker, args=(playlist_id,), daemon=True).start()
 
     def get_cached_playlist_tracks(self, playlist_id):
         return self._playlist_cache.get(playlist_id)

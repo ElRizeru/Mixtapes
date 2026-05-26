@@ -2,7 +2,7 @@
 ; Build with: iscc installer.iss
 
 #define MyAppName "Mixtapes"
-#define MyAppVersion "2026.24.05.0"
+#define MyAppVersion "2026.26.05.0"
 #define MyAppPublisher "pocoguy"
 #define MyAppURL "https://github.com/m-obeid/Mixtapes"
 #define MyAppExeName "Mixtapes.exe"
@@ -42,6 +42,7 @@ Source: "{#SourcePath}\Mixtapes.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourcePath}\windows\MixtapesBridge.exe"; DestDir: "{app}\windows"; Flags: ignoreversion
 Source: "{#SourcePath}\windows\MixtapesLogin.exe"; DestDir: "{app}\windows"; Flags: ignoreversion
 Source: "{#SourcePath}\windows\mixtapes.ico"; DestDir: "{app}\windows"; Flags: ignoreversion
+Source: "{#SourcePath}\windows\fonts.conf"; DestDir: "{app}\windows"; Flags: ignoreversion
 
 ; Debug launcher
 Source: "{#SourcePath}\mixtapes-debug.bat"; DestDir: "{app}"; Flags: ignoreversion

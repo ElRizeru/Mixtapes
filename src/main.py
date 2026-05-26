@@ -33,6 +33,36 @@ if sys.platform == "win32":
                         except Exception as _e:
                             print(f"Could not install font {_f}: {_e}")
 
+# Force Pango's FontConfig/FreeType backend on Windows so text is laid out
+# and rasterized the same way as the Linux build (slight hinting, grayscale
+# AA, GNOME-style metrics) — not the OS-default `win32` Pango backend which
+# follows Windows' DirectWrite/ClearType pipeline and gives a visibly
+# different feel.
+#
+# Must run BEFORE `import gi`: Pango reads PANGOCAIRO_BACKEND once, when its
+# default font map is created at module-init time. Setting it after gi is
+# already loaded is a no-op.
+#
+# Falls back silently to win32 if the GTK build doesn't include the fc
+# backend (older bundles), so this is safe to set unconditionally on
+# Windows. Respect an existing override if the user has already set the
+# env var themselves — useful for A/B testing.
+if sys.platform == "win32" and not os.environ.get("PANGOCAIRO_BACKEND"):
+    os.environ["PANGOCAIRO_BACKEND"] = "fc"
+
+# Point FontConfig at our bundled windows/fonts.conf. Same timing
+# constraint as PANGOCAIRO_BACKEND — FontConfig reads FONTCONFIG_FILE
+# at the first FcInit() call, which happens deep inside Pango's import
+# path. Without this, FontConfig on Windows falls back to a minimal
+# built-in config that doesn't know about WINDOWSFONTDIR or the per-user
+# fonts dir where we just installed Adwaita Sans, and text renders with
+# whatever happens to be hardcoded as a last-resort fallback.
+if sys.platform == "win32" and not os.environ.get("FONTCONFIG_FILE"):
+    _proj_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _fc_path = os.path.join(_proj_root, "windows", "fonts.conf")
+    if os.path.isfile(_fc_path):
+        os.environ["FONTCONFIG_FILE"] = _fc_path
+
 # Apply the user-chosen GSK renderer *before* GTK loads. Some NVIDIA driver
 # versions crash inside the default renderer (libnvidia-glcore + gsk_renderer_render);
 # users can override via Preferences → Application.
@@ -107,8 +137,29 @@ class MusicApp(Adw.Application):
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
         )
 
-        # On Windows, use Adwaita Sans if installed
+        # On Windows, use Adwaita Sans if installed. We also explicitly
+        # set the global font name (including size) — Windows' GTK default
+        # is a smaller `Segoe UI 9` and the previous CSS rule only overrode
+        # the family, so Adwaita Sans rendered at Windows' 9pt instead of
+        # the 11pt the Linux/GNOME stack uses by default. That made the
+        # whole UI feel ~80% the size of the Linux build at 100% scaling.
         if sys.platform == "win32":
+            settings = Gtk.Settings.get_default()
+            if settings is not None:
+                settings.set_property("gtk-font-name", "Adwaita Sans 11")
+                # Match GNOME's text-rendering defaults so the look is
+                # closer to the Linux build: slight hinting (not full),
+                # grayscale antialias (not ClearType subpixel), 96 dpi.
+                # These map onto Cairo font options when GTK4 paints text,
+                # so they apply on Windows too as long as the GTK build's
+                # Cairo backend honors the antialias / hint options
+                # (the gvsbuild-style packaging does).
+                settings.set_property("gtk-xft-antialias", 1)
+                settings.set_property("gtk-xft-hinting", 1)
+                settings.set_property("gtk-xft-hintstyle", "hintslight")
+                settings.set_property("gtk-xft-rgba", "none")
+                # 96 dpi * 1024 — GTK stores xft-dpi in 1024ths of a pt.
+                settings.set_property("gtk-xft-dpi", 98304)
             font_css = Gtk.CssProvider()
             font_css.load_from_string(
                 "* { font-family: 'Adwaita Sans Text', 'Adwaita Sans', 'Segoe UI', sans-serif; }"

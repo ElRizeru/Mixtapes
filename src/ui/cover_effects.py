@@ -20,6 +20,15 @@ from ui.utils import (
 _blur_cache = {}    # url -> path to blurred PNG
 _color_cache = {}   # url -> (r, g, b) normalized 0..1
 
+# Coalesce concurrent _ensure_image_bytes() calls for the same URL. On a
+# track change the blur + accent-color workers both run on their own
+# thread, and historically both raced to fetch the same image bytes —
+# i.e. two HTTP GETs to YouTube's CDN per track. Now the second caller
+# waits on the first one's Event and then reads the freshly-populated
+# disk cache.
+_inflight_lock = threading.Lock()
+_inflight = {}  # url -> threading.Event
+
 
 def _blur_cache_dir():
     path = os.path.join(GLib.get_user_cache_dir(), "muse", "covers_blurred")
@@ -78,33 +87,53 @@ def _ensure_image_bytes(url):
     data = read_thumb_cache(url)
     if data:
         return data
+
+    # Coalesce concurrent fetches for the same URL — one leader does the
+    # HTTP, everyone else waits and reads the populated cache.
+    with _inflight_lock:
+        event = _inflight.get(url)
+        is_leader = event is None
+        if is_leader:
+            event = threading.Event()
+            _inflight[url] = event
+    if not is_leader:
+        # Cap the wait so a stuck leader (e.g. dead network) doesn't
+        # hang follower threads forever.
+        event.wait(timeout=20)
+        return read_thumb_cache(url)
+
     try:
-        import requests
-    except Exception as e:
-        print(f"[cover_effects] requests import failed: {e}")
-        return None
-    last_err = None
-    for candidate in _yt_thumb_fallback_urls(url):
         try:
-            resp = requests.get(
-                candidate, timeout=10, headers={"User-Agent": "Mozilla/5.0"}
-            )
-            resp.raise_for_status()
-            data = resp.content
-            # Cache under the originally-requested URL so subsequent
-            # lookups for the same key hit the cache, regardless of
-            # which fallback actually served the bytes.
-            write_thumb_cache(url, data)
-            return data
+            import requests
         except Exception as e:
-            last_err = e
-            # Only walk to the next fallback on 404 — other errors
-            # (timeout, DNS, etc.) won't be fixed by a different URL.
-            status = getattr(getattr(e, "response", None), "status_code", None)
-            if status != 404:
-                break
-    print(f"[cover_effects] fetch failed: {last_err}")
-    return None
+            print(f"[cover_effects] requests import failed: {e}")
+            return None
+        last_err = None
+        for candidate in _yt_thumb_fallback_urls(url):
+            try:
+                resp = requests.get(
+                    candidate, timeout=10, headers={"User-Agent": "Mozilla/5.0"}
+                )
+                resp.raise_for_status()
+                data = resp.content
+                # Cache under the originally-requested URL so subsequent
+                # lookups for the same key hit the cache, regardless of
+                # which fallback actually served the bytes.
+                write_thumb_cache(url, data)
+                return data
+            except Exception as e:
+                last_err = e
+                # Only walk to the next fallback on 404 — other errors
+                # (timeout, DNS, etc.) won't be fixed by a different URL.
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                if status != 404:
+                    break
+        print(f"[cover_effects] fetch failed: {last_err}")
+        return None
+    finally:
+        with _inflight_lock:
+            _inflight.pop(url, None)
+        event.set()
 
 
 # ─── Blurred background ────────────────────────────────────────────────────
