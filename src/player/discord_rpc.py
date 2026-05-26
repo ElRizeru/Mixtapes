@@ -11,7 +11,13 @@ import uuid
 
 DISCORD_APP_ID = "1492500060087255231"
 
-RECONNECT_BACKOFF = [5, 15, 30, 60, 120]
+# Schedule of reconnect delays in seconds when the Discord IPC pipe isn't
+# reachable. After exhausting the list we stay at the final value, so the
+# tail is what dominates "Mixtapes opened before Discord" — keep it small
+# so a user who launches Discord a few minutes later sees Rich Presence
+# light up within ~30s rather than the previous 2-minute worst case. The
+# poll is essentially a single failed open()/connect(); cost is negligible.
+RECONNECT_BACKOFF = [3, 5, 10, 15, 30]
 
 STATUS_DISPLAY_TYPES = {
     "app_name": 0,
