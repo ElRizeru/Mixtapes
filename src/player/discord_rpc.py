@@ -51,6 +51,9 @@ def get_small_icon_enabled():
     return _get_prefs().get("discord_rpc_small_icon_enabled", True)
 
 
+def get_hide_pause_enabled():
+    return _get_prefs().get("discord_rpc_hide_pause_enabled", False)
+
 OP_HANDSHAKE = 0
 OP_FRAME = 1
 OP_CLOSE = 2
@@ -344,7 +347,7 @@ class DiscordRPCAdapter:
     def _build_activity(self):
         player = self.player
         state = player.get_state_string()
-        if state == "stopped":
+        if state == "stopped" or (get_hide_pause_enabled() and state == "paused"):
             return None
 
         idx = player.current_queue_index
