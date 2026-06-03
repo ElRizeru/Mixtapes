@@ -1,12 +1,15 @@
 from __future__ import annotations
+from typing import override
 import gi
 
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst
 from mprisify.adapters import MprisAdapter
+from mprisify.server import Server
 from mprisify.events import EventAdapter
-from mprisify.base import Position, PlayState, Volume
-from mprisify.enums import LoopStatus
+from mprisify.interfaces.interface import MprisInterface
+from mprisify.base import Position, PlayState, Volume, NAME
+from mprisify.enums import BusType, LoopStatus
 
 
 class MuseMprisAdapter(MprisAdapter):
@@ -254,6 +257,12 @@ class MuseMprisAdapter(MprisAdapter):
             print(f"MPRIS: Error generating metadata: {e}")
             return {}
 
+
+class MuseServer(Server[MprisAdapter, EventAdapter, MprisInterface[MprisAdapter]]):    
+    @override
+    def publish(self, bus_type: BusType = BusType.DEFAULT):
+        if self._publication_token == None:
+            super().publish(bus_type)
 
 class MuseEventAdapter(EventAdapter):
     def emit_all(self):
