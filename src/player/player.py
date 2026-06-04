@@ -317,8 +317,6 @@ class Player(GObject.Object):
             self.connect("progression", self._on_mpris_progression)
             self.connect("volume-changed", self._on_mpris_volume_changed)
 
-            self.mpris_server.unpublish()
-
         # SMTC Setup (Windows-only)
         if HAS_SMTC:
             try:
