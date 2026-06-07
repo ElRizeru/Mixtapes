@@ -476,6 +476,13 @@ class DownloadDB:
         the `meta_json` column and should contain fields like `description`,
         `year`, `privacy`, `duration_seconds`, `thumbnails`, and
         `author_raw` (the original artist-dict list)."""
+
+        # RDTMAK playlist are mixes, which always updates and changes
+        # no need to cache, the next fetch will be completely different
+        if playlist_id.startswith("RDTMAK"):
+            print(f"[CLIENT] cache_playlist: reject caching, playlist {playlist_id} is a mix that always changes")
+            return
+
         # Never write the cache when offline — offline responses are
         # themselves reconstructed from the cache, and persisting them
         # would trigger the regression guard for legitimately-shrunken
@@ -487,6 +494,7 @@ class DownloadDB:
                 return
         except Exception:
             pass
+        
         with self._lock:
             conn = self._connect()
             self._ensure_meta_json_column(conn)
@@ -563,6 +571,13 @@ class DownloadDB:
     def get_cached_playlist(self, playlist_id):
         """Get cached playlist data. Returns dict or None. Dict has the
         standard columns plus `tracks` (list) and `meta` (dict)."""
+
+        # RDTMAK playlist are mixes, which always updates and changes
+        # no point getting from cache, the fetched will be completely different
+        if playlist_id.startswith("RDTMAK"):
+            print(f"[CLIENT] get_cached_playlist: reject caching, playlist {playlist_id} is a mix that always changes")
+            return None
+
         with self._lock:
             conn = self._connect()
             self._ensure_meta_json_column(conn)
