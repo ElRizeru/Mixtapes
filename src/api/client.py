@@ -2583,7 +2583,11 @@ class MusicClient:
                     playlist_id,
                     data.get("title", ""),
                     author_str,
-                    track_count or len(tracks),
+
+                    # dont use track_count; YouTube Music sometimes give a trackCount value higher than there actually is
+                    # if the value is higher than there actually is, it causes cache regression when there isnt any
+                    len(tracks), 
+                    
                     tracks,
                     meta,
                 )
