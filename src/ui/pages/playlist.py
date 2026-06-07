@@ -1998,8 +1998,8 @@ class PlaylistPage(Adw.Bin):
 
             elif playlist_id == "LM":
                 data = self.client.get_liked_songs(limit=self.current_limit)
-                title = "Your Likes"
-                description = "Your liked songs from YouTube Music."
+                title = data.get("title", "Unknown Album")
+                description = data.get("description", "")
                 tracks = data.get("tracks", []) if isinstance(data, dict) else data
                 track_count = (
                     data.get("trackCount", len(tracks))

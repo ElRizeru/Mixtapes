@@ -1465,6 +1465,16 @@ class MusicClient:
                     )
                 else:
                     author_str = str(raw_author or "")
+
+                # modify title and description field to a hardcoded value for Liked Music playlist
+                # this modification with a hardcoded value used to exist in `_fetch_playlist_details`
+                # we move it down to the get_playlist level so that the cache and display value doesnt mismatch
+                if playlist_id == "LM":
+                    if "title" in result:
+                        result["title"] = "Your Likes"
+                    if "description" in result:
+                        result["description"] = "Your liked songs from YouTube Music."
+
                 # Store the rich metadata so PlaylistPage can re-render the
                 # full header (year, privacy, author-as-link, etc.) on the
                 # next open before the live fetch completes.
