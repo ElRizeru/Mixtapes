@@ -2006,8 +2006,12 @@ class PlaylistPage(Adw.Bin):
                     if isinstance(data, dict)
                     else len(tracks)
                 )
-                song_text = "song" if track_count == 1 else "songs"
-                count_str = f"{track_count} {song_text}"
+
+                # track_counts from "trackCount" key can sometimes overcount; a bug from YouTube Music itself
+                # so use length of tracks array
+                song_text = "song" if len(tracks) == 1 else "songs"
+                count_str = f"{len(tracks)} {song_text}"
+
                 year = None
                 author = "You"
                 thumbnails = []
@@ -2036,6 +2040,8 @@ class PlaylistPage(Adw.Bin):
                     track_count = data.get("trackCount", len(tracks))
                     year = data.get("year", "")
 
+                    # track_counts from "trackCount" key can sometimes overcount; a bug from YouTube Music itself
+                    # but we still use it to determine its album_type because they're all determined by YouTube Music
                     if track_count == 1:
                         album_type = "Single"
                     elif 2 <= track_count <= 6:
@@ -2046,8 +2052,12 @@ class PlaylistPage(Adw.Bin):
                     meta_parts = [album_type]
                     if year:
                         meta_parts.append(str(year))
-                    song_text = "song" if track_count == 1 else "songs"
-                    count_str = f"{track_count} {song_text}"
+                    
+                    # track_counts from "trackCount" key can sometimes overcount; a bug from YouTube Music itself
+                    # so use length of tracks array
+                    song_text = "song" if len(tracks) == 1 else "songs"
+                    count_str = f"{len(tracks)} {song_text}"
+
                     meta_parts.append(count_str)
                     count = " • ".join(meta_parts)
 
@@ -2117,8 +2127,10 @@ class PlaylistPage(Adw.Bin):
                         song_text = "Infinite"
                         count_str = "Infinite"
                     else:
-                        song_text = "song" if track_count == 1 else "songs"
-                        count_str = f"{track_count} {song_text}"
+                        # track_counts from "trackCount" key can sometimes overcount; a bug from YouTube Music itself
+                        # so use length of tracks array
+                        song_text = "song" if len(tracks) == 1 else "songs"
+                        count_str = f"{len(tracks)} {song_text}"
 
                     meta_parts = []
                     privacy = data.get("privacy")
@@ -2223,8 +2235,10 @@ class PlaylistPage(Adw.Bin):
                 if "track_count" in locals() and track_count is None:
                     meta2_parts.append("Infinite")
                 else:
+                    # track_counts from "trackCount" key can sometimes overcount; a bug from YouTube Music itself
+                    # so use length of tracks array
                     meta2_parts.append(
-                        f"{locals().get('track_count', 0)} {locals().get('song_text', 'songs')}"
+                        f"{len(locals().get('tracks', []))} {locals().get('song_text', 'songs')}"
                     )
             if duration_str:
                 meta2_parts.append(duration_str)
