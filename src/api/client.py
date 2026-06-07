@@ -2926,7 +2926,7 @@ class MusicClient:
         if not self.is_authenticated():
             return []
         # Liked songs is actually a playlist 'LM'
-        res = self.api.get_liked_songs(limit=limit)
+        res = self.get_playlist("LM", limit=limit)
         return res
 
     def get_charts(self, country="US"):
