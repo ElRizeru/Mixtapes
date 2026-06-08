@@ -174,7 +174,7 @@ chmod +x build.sh
 Run the app with:
 
 ```bash
-./mixtapes
+./src/mixtapes
 ```
 
 <details>
