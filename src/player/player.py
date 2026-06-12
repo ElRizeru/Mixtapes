@@ -24,8 +24,7 @@ if sys.platform == "win32":
         pass
 else:
     try:
-        from mprisify.server import Server
-        from player.mpris import MuseMprisAdapter, MuseEventAdapter
+        from player.mpris import MuseMprisAdapter, MuseServer, MuseEventAdapter
         HAS_MPRIS = True
     except ImportError:
         pass
@@ -295,8 +294,8 @@ class Player(GObject.Object):
             print(f"Discord RPC init failed: {e}")
             self.discord_rpc = None
 
-    def load_media_api(self):
-        "Starts MPRIS or SMTC for Linux or Windows, called once only when player starts playing a track"
+    def _load_media_api(self):
+        "Starts MPRIS or SMTC for Linux or Windows, loads once only when _start_playback is called"
         if self.media_api_loaded:
             return
 
@@ -305,7 +304,7 @@ class Player(GObject.Object):
         # MPRIS Setup (Linux-only, requires D-Bus)
         if HAS_MPRIS:
             self.mpris_adapter = MuseMprisAdapter(self)
-            self.mpris_server = Server("Mixtapes", adapter=self.mpris_adapter)
+            self.mpris_server = MuseServer("Mixtapes", adapter=self.mpris_adapter)
             self.mpris_events = MuseEventAdapter(
                 self.mpris_server.root, self.mpris_server.player
             )
@@ -1013,8 +1012,6 @@ class Player(GObject.Object):
 
     def _play_current_index(self):
         if 0 <= self.current_queue_index < len(self.queue):
-            self.load_media_api()
-
             track = self.queue[self.current_queue_index]
             video_id, title, artist, thumb, like_status = (
                 self._normalize_track_metadata(track)
@@ -1931,6 +1928,11 @@ class Player(GObject.Object):
             except Exception as e:
                 print(f"[PLAYBACK] start failed: {e}")
         threading.Thread(target=_drive, daemon=True).start()
+
+        self._load_media_api()
+        if hasattr(self, "mpris_server"):
+            self.mpris_server.publish()
+
         return False
 
     def play(self):
@@ -1942,6 +1944,9 @@ class Player(GObject.Object):
         self._update_logical_state()
 
     def stop(self):
+        if hasattr(self, "mpris_server"):
+            self.mpris_server.unpublish()
+        
         self.player.set_state(Gst.State.NULL)
         self._is_loading = False
         self._pending_gapless_index = None

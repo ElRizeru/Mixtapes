@@ -2200,6 +2200,23 @@ class MainWindow(Adw.ApplicationWindow):
         display_row.connect("notify::selected", on_display_changed)
         rpc_group.add(display_row)
 
+        hide_pause_row = Adw.SwitchRow()
+        hide_pause_row.set_title("Hide on Pause")
+        hide_pause_row.set_subtitle("Hide Discord RPC when music is paused")
+        hide_pause_row.set_active(_prefs.get("discord_rpc_hide_pause_enabled", False))
+        hide_pause_row.set_sensitive(rpc_enabled_row.get_active())
+
+        def on_hide_pause_toggled(switch, pspec):
+            _prefs["discord_rpc_hide_pause_enabled"] = switch.get_active()
+            os.makedirs(os.path.dirname(_prefs_path), exist_ok=True)
+            with open(_prefs_path, "w") as f:
+                _json.dump(_prefs, f)
+            if rpc_adapter and rpc_adapter._enabled:
+                rpc_adapter.update()
+        
+        hide_pause_row.connect("notify::active", on_hide_pause_toggled)
+        rpc_group.add(hide_pause_row)
+
         # Small icon toggle
         small_icon_row = Adw.SwitchRow()
         small_icon_row.set_title("Show Play/Pause Icon")
