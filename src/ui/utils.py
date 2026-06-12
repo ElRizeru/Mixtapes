@@ -1396,6 +1396,13 @@ class LikeButton(Gtk.Button):
             if not success:
                 # Revert on failure
                 GLib.idle_add(self.revert, old_status)
+            else:
+                # if disliked, invalidate Liked Music playlist cache
+                # this avoids the regression skip
+                # normal playlists have a similar functionality to invalidate cache when a track is removed
+                if new_status == "INDIFFERENT":
+                    from player.downloads import get_download_db
+                    get_download_db().invalidate_playlist_cache("LM")
 
         thread = threading.Thread(target=do_rate)
         thread.daemon = True

@@ -1465,6 +1465,16 @@ class MusicClient:
                     )
                 else:
                     author_str = str(raw_author or "")
+
+                # modify title and description field to a hardcoded value for Liked Music playlist
+                # this modification with a hardcoded value used to exist in `_fetch_playlist_details`
+                # we move it down to the get_playlist level so that the cache and display value doesnt mismatch
+                if playlist_id == "LM":
+                    if "title" in result:
+                        result["title"] = "Your Likes"
+                    if "description" in result:
+                        result["description"] = "Your liked songs from YouTube Music."
+
                 # Store the rich metadata so PlaylistPage can re-render the
                 # full header (year, privacy, author-as-link, etc.) on the
                 # next open before the live fetch completes.
@@ -2583,7 +2593,11 @@ class MusicClient:
                     playlist_id,
                     data.get("title", ""),
                     author_str,
-                    track_count or len(tracks),
+
+                    # dont use track_count; YouTube Music sometimes give a trackCount value higher than there actually is
+                    # if the value is higher than there actually is, it causes cache regression when there isnt any
+                    len(tracks), 
+                    
                     tracks,
                     meta,
                 )
@@ -2922,7 +2936,7 @@ class MusicClient:
         if not self.is_authenticated():
             return []
         # Liked songs is actually a playlist 'LM'
-        res = self.api.get_liked_songs(limit=limit)
+        res = self.get_playlist("LM", limit=limit)
         return res
 
     def get_charts(self, country="US"):
