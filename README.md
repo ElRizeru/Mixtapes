@@ -141,6 +141,8 @@ sudo apt install git python3 python3-pip nodejs libgtk-4-dev libadwaita-1-dev li
 
 </details>
 
+#### Option 1: Running from source
+
 ```bash
 git clone https://github.com/m-obeid/Mixtapes.git
 cd Mixtapes
@@ -156,6 +158,23 @@ To update:
 ```bash
 git pull
 pip install -r requirements.txt
+```
+
+#### Option 2: build as binary with Nuitka
+
+Ensure dependencies are installed
+
+```bash
+git clone https://github.com/m-obeid/Mixtapes.git
+cd Mixtapes
+chmod +x build.sh
+./build.sh
+```
+
+Run the app with:
+
+```bash
+./src/mixtapes
 ```
 
 <details>
