@@ -65,6 +65,16 @@ listview.playlist-view > row:focus:selected {
   outline: none;
 }
 
+/* Keyboard focus ring for song rows. The reset above clears the row's own
+   outline (selection/hover is drawn on the inner .song-row), which also left
+   Tab navigation with no visible indicator. Draw the ring on the rounded
+   inner box instead. :focus-visible keeps it keyboard-only — a mouse click
+   focuses the row without flashing a ring. */
+listview.playlist-view > row:focus-visible box.song-row {
+  outline: 2px solid @accent_color;
+  outline-offset: -2px;
+}
+
 .sort-dropdown > button:not(:hover):not(:active) {
   background: none;
   box-shadow: none;
@@ -126,6 +136,38 @@ box.song-row {
 /* Only apply custom hover in the main playlist/search list views */
 listview.playlist-view box.song-row:hover {
   background-color: @row_hover;
+}
+
+/* While a view is actively scrolling, freeze the hover-background fades.
+   Rows/cards sliding under a stationary pointer re-toggle :hover every frame,
+   and each fade is a 150-300 ms animation — dozens overlapping is what makes
+   scrolling stutter only when the pointer is over content. The is-scrolling
+   class is added/removed by suppress_hover_while_scrolling(); a still pointer
+   (genuine hover) keeps the fade. Selectors are kept specific enough to win
+   the cascade over the base transition rules they mirror. */
+.is-scrolling box.song-row,
+.is-scrolling .artist-horizontal-item,
+.is-scrolling .home-speed-tile,
+.is-scrolling row,
+.is-scrolling .card,
+.is-scrolling box.song-row button,
+.is-scrolling box.song-row image {
+  transition: none;
+}
+
+/* Freezing the *fade* still left an instant per-row repaint as each row's
+   :hover background flipped on/off under the moving content. Blank the hover
+   background entirely while scrolling so a row passing under the pointer
+   produces no visual change at all — the actual residual stutter. The
+   stationary highlight returns the moment the scroll settles;
+   .playing/.selected keep their persistent tint. Child controls (like button,
+   menu) get the same treatment so their Adwaita hover doesn't repaint either. */
+.is-scrolling listview.playlist-view box.song-row:hover:not(.playing):not(.selected),
+.is-scrolling list > row:hover:not(.playing) box.song-row,
+.is-scrolling .artist-horizontal-item:hover,
+.is-scrolling box.song-row button:hover,
+.is-scrolling list > row:hover:not(.playing) {
+  background-color: transparent;
 }
 
 /* Selected indicator (multi-select) */
@@ -212,6 +254,13 @@ listview.playlist-view > row:disabled {
   background-color: alpha(currentColor, 0.15);
 }
 
+/* Keyboard focus ring for the home horizontal cards (now focusable). Follows
+   the item's 12px radius; keyboard-only so mouse clicks don't flash a ring. */
+.artist-horizontal-item:focus-visible {
+  outline: 2px solid @accent_color;
+  outline-offset: -2px;
+}
+
 .explicit-badge {
   background-color: alpha(currentColor, 0.15);
   color: inherit;
@@ -286,6 +335,15 @@ flowboxchild {
 
 flowboxchild:focus {
   outline: none;
+}
+
+/* Keyboard focus ring for grid tiles (library cards, quick-pick tiles).
+   Placed after the :focus reset so it wins for keyboard focus only; a plain
+   mouse :focus stays ringless. Follows the child's 8px radius and insets so
+   it isn't clipped by neighbouring tiles. */
+flowboxchild:focus-visible {
+  outline: 2px solid @accent_color;
+  outline-offset: -2px;
 }
 
 .home-speed-cover {

@@ -139,6 +139,10 @@ class LibraryPage(Adw.Bin):
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_vexpand(True)
         scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        # Suppress hover-background fades while scrolling — they cause stutter
+        # when the pointer sits over cards/rows that slide past it.
+        from ui.utils import suppress_hover_while_scrolling
+        suppress_hover_while_scrolling(scrolled)
 
         clamp = Adw.Clamp()
         # Match PlaylistPage's width so the Library/Explore/Playlist views
@@ -691,18 +695,19 @@ class LibraryPage(Adw.Bin):
             # When a remote URL is available, fire a background refresh
             # of the on-disk copy so edits on YT propagate — the shared
             # helper dedupes so the grid rebuild doesn't spawn duplicate
-            # downloads for the same playlist.
-            from player.downloads import get_music_dir, _sanitize_filename
-
-            cover_path = os.path.join(
-                get_music_dir(), "Playlists", f"{_sanitize_filename(title)}.jpg"
+            # downloads for the same playlist. The local URL carries the
+            # file's mtime so a re-downloaded/edited cover changes the URL
+            # and repaints this tile instead of reusing the stale pixbuf.
+            from ui.utils import (
+                save_playlist_cover_async,
+                local_playlist_cover_url,
             )
-            has_local = os.path.exists(cover_path)
+
             if not offline and thumb_url:
-                from ui.utils import save_playlist_cover_async
                 save_playlist_cover_async(self.player, title, thumb_url)
-            if has_local:
-                thumb_url = f"file://{cover_path}"
+            local_url = local_playlist_cover_url(title)
+            if local_url:
+                thumb_url = local_url
 
             is_owned = self.client.is_own_playlist(p, playlist_id=p_id)
 
@@ -959,14 +964,11 @@ class LibraryPage(Adw.Bin):
             thumb_url = thumbnails[-1]["url"] if thumbnails else None
 
             # Use locally saved playlist cover when offline
-            from ui.utils import is_online
+            from ui.utils import is_online, local_playlist_cover_url
             if not is_online():
-                from player.downloads import get_music_dir, _sanitize_filename
-                cover_path = os.path.join(
-                    get_music_dir(), "Playlists", f"{_sanitize_filename(title)}.jpg"
-                )
-                if os.path.exists(cover_path):
-                    thumb_url = f"file://{cover_path}"
+                local_url = local_playlist_cover_url(title)
+                if local_url:
+                    thumb_url = local_url
 
             processed_ids.add(p_id)
 

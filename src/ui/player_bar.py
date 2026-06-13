@@ -350,20 +350,44 @@ class PlayerBar(Gtk.Box):
         # Priority of overflowing: like first, then queue, then volume.
         # Thresholds picked so each hidden control gives ~40-60px back to
         # the meta box. Tweak in one place if the bar's metrics change.
-        like_inline = width >= 720
-        queue_inline = width >= 640
-        volume_inline = width >= 560
+        candidates = [
+            (self.like_btn, width >= 720),
+            (self.queue_btn, width >= 640),
+            (self.volume_container, width >= 560),
+        ]
+        overflow = [control for control, inline in candidates if not inline]
 
-        self._set_control_location(self.like_btn, inline=like_inline)
-        self._set_control_location(self.queue_btn, inline=queue_inline)
-        self._set_control_location(self.volume_container, inline=volume_inline)
+        # Overflowing a single control saves no space: the 3-dot button we'd
+        # add is the same width as the control we'd remove, so a 1-item
+        # dropdown is a pure 1:1 swap. Only fold things away once at least
+        # two controls would move — then hiding N gives a net N-1 back.
+        if len(overflow) < 2:
+            overflow = []
 
-        # The overflow button itself only appears when at least one of the
-        # three controls is hidden. It also disappears when no track is
-        # loaded (since the like_btn isn't really meaningful then anyway).
-        any_overflowed = not (like_inline and queue_inline and volume_inline)
-        self.overflow_btn.set_visible(any_overflowed)
+        for control, _ in candidates:
+            self._set_control_location(control, inline=control not in overflow)
+
+        # The overflow button only appears when it actually buys space.
+        self.overflow_btn.set_visible(bool(overflow))
         return True
+
+    # Canonical left-to-right order of the controls that overflow, matching
+    # the order they're appended in __init__ (volume → queue → like). Used to
+    # re-inline them in the right place regardless of the order they happen to
+    # come back in as the bar widens.
+    def _responsive_order(self):
+        return [self.volume_container, self.queue_btn, self.like_btn]
+
+    def _inline_anchor_for(self, control):
+        """The sibling a re-inlined control should sit after: the nearest
+        canonically-preceding control that's already inline, or next_btn if
+        none of its predecessors are inline yet."""
+        order = self._responsive_order()
+        idx = order.index(control)
+        for prev in reversed(order[:idx]):
+            if prev.get_parent() is self.controls_box:
+                return prev
+        return self.next_btn
 
     def _set_control_location(self, control, inline):
         """Move `control` between the inline controls_box and the overflow
@@ -372,9 +396,12 @@ class PlayerBar(Gtk.Box):
         parent = control.get_parent()
         if inline and parent is self._overflow_box:
             self._overflow_box.remove(control)
-            # Re-insert before the overflow button so the original ordering
-            # (like → queue → volume → overflow → expand) is preserved.
-            self.controls_box.insert_child_after(control, self.next_btn)
+            # Re-insert after its canonical predecessor so the original
+            # ordering (volume → queue → like → overflow → expand) survives
+            # being torn apart and reassembled as the bar resizes.
+            self.controls_box.insert_child_after(
+                control, self._inline_anchor_for(control)
+            )
         elif (not inline) and parent is self.controls_box:
             self.controls_box.remove(control)
             self._overflow_box.append(control)

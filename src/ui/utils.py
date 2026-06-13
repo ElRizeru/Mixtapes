@@ -395,6 +395,55 @@ _COVER_DL_LOCK = threading.Lock()
 _COVER_FRESHNESS_SECONDS = 24 * 60 * 60  # one day
 
 
+def playlist_cover_path(title):
+    """Absolute path of a playlist's locally-cached cover, or None if the
+    title is empty / the music dir can't be resolved. Does not touch disk."""
+    if not title:
+        return None
+    try:
+        from player.downloads import get_music_dir, _sanitize_filename
+
+        return os.path.join(
+            get_music_dir(), "Playlists", f"{_sanitize_filename(title)}.jpg"
+        )
+    except Exception:
+        return None
+
+
+def local_playlist_cover_url(title):
+    """A `file://` URL for a playlist's cached cover, stamped with the file's
+    mtime (`?m=<epoch>`), or None when no local copy exists.
+
+    The mtime stamp is load-bearing: the in-memory pixbuf cache and the grid's
+    "reload only if the URL changed" check are both keyed on the URL string.
+    A bare path stays identical when the bytes are replaced (remote/local
+    edit), so the stale art would survive; folding mtime into the URL makes a
+    content change look like a new URL — busting the cache and repainting the
+    tile. The single os.stat also replaces the os.path.exists check, so this
+    adds no extra syscall. `_fetch_image` strips the query before opening."""
+    cover_path = playlist_cover_path(title)
+    if not cover_path:
+        return None
+    try:
+        st = os.stat(cover_path)
+    except OSError:
+        return None
+    # Nanosecond mtime so two saves in the same wall-clock second still produce
+    # distinct URLs (a second-resolution stamp could alias a fresh cover onto
+    # the stale pixbuf).
+    return f"file://{cover_path}?m={st.st_mtime_ns}"
+
+
+def _cover_identity(url):
+    """The stable part of a cover URL — everything before the query string.
+
+    YT custom-cover URLs (pl_c/...) carry signed `sqp`/`rs` params that rotate
+    on every fetch even when the image is unchanged, so the full URL is useless
+    as a "did the art change?" signal. The path identifies the image; the query
+    only signs access to it."""
+    return (url or "").split("?", 1)[0]
+
+
 def save_playlist_cover_async(player, title, url):
     """Download a playlist's cover to <music_dir>/playlists/<title>.jpg so
     future opens (from anywhere — library grid, playlist page) can render
@@ -404,30 +453,18 @@ def save_playlist_cover_async(player, title, url):
     which a naked `requests.get` doesn't carry. We pass the signed-in
     client's Cookie header so those URLs resolve.
 
-    Re-fetches at most once per day so YT-side edits eventually propagate.
-    Library rebuilds were calling this for every tile on every navigation,
-    which produced one TLS handshake per tile and dominated the worker pool.
+    Re-fetches when either (a) the local copy is older than a day, or (b) the
+    cover's identity (the URL minus its signing query) differs from what we
+    last saved — so an edit on YT, or from Mixtapes, propagates on the next
+    library load instead of waiting out the freshness window. A `.url` sidecar
+    records the identity of the bytes on disk.
+
+    All disk I/O happens on the worker thread: library rebuilds call this once
+    per tile during grid build, and doing the stat/makedirs inline stalled the
+    main thread on dozens of syscalls before any tile painted.
     """
     if not title or not url:
         return
-    try:
-        from player.downloads import get_music_dir, _sanitize_filename
-
-        cover_dir = os.path.join(get_music_dir(), "Playlists")
-        os.makedirs(cover_dir, exist_ok=True)
-        cover_path = os.path.join(cover_dir, f"{_sanitize_filename(title)}.jpg")
-    except Exception:
-        return
-
-    # Freshness gate: if we already have a recent local copy, don't re-fetch.
-    # The playlist page's refresh button still triggers an unconditional
-    # reload, so users with stale art have a clear escape hatch.
-    try:
-        st = os.stat(cover_path)
-        if (time.time() - st.st_mtime) < _COVER_FRESHNESS_SECONDS:
-            return
-    except OSError:
-        pass  # missing or unreadable — proceed to download
 
     key = (title, url)
     with _COVER_DL_LOCK:
@@ -437,6 +474,33 @@ def save_playlist_cover_async(player, title, url):
 
     def _dl():
         try:
+            cover_path = playlist_cover_path(title)
+            if not cover_path:
+                return
+            try:
+                os.makedirs(os.path.dirname(cover_path), exist_ok=True)
+            except OSError:
+                return
+
+            # Freshness gate: skip the re-fetch only when we have a recent copy
+            # *and* it was saved from the same cover identity. A changed
+            # identity (remote/local edit) always re-downloads; the playlist
+            # page's refresh button remains an unconditional escape hatch.
+            sidecar = cover_path + ".url"
+            try:
+                st = os.stat(cover_path)
+                fresh = (time.time() - st.st_mtime) < _COVER_FRESHNESS_SECONDS
+                if fresh:
+                    try:
+                        with open(sidecar, "r", encoding="utf-8") as f:
+                            saved_identity = f.read().strip()
+                    except OSError:
+                        saved_identity = None
+                    if saved_identity == _cover_identity(url):
+                        return
+            except OSError:
+                pass  # missing or unreadable — proceed to download
+
             import requests
 
             headers = {"User-Agent": "Mozilla/5.0"}
@@ -483,6 +547,16 @@ def save_playlist_cover_async(player, title, url):
                 if resp.status_code == 200 and len(resp.content) > 1000:
                     with open(cover_path, "wb") as f:
                         f.write(resp.content)
+                    # Record the identity of the bytes now on disk so the next
+                    # freshness check can tell an unchanged cover from an edit.
+                    try:
+                        with open(sidecar, "w", encoding="utf-8") as f:
+                            f.write(_cover_identity(url))
+                    except OSError:
+                        pass
+                    # The on-disk bytes changed; readers key the in-memory
+                    # pixbuf cache on the file's mtime (local_playlist_cover_url),
+                    # so the new mtime busts the stale entry automatically.
                     print(
                         f"[COVER] saved {cover_path} from {candidate} "
                         f"({len(resp.content)} bytes)"
@@ -505,6 +579,54 @@ def save_playlist_cover_async(player, title, url):
     # the dominant load in py-spy and starved the main thread of the GIL.
     # Routing through the shared pool caps concurrency at max_workers.
     submit_fetch(_dl)
+
+
+def suppress_hover_while_scrolling(scrolled, settle_ms=110):
+    """Disable pointer hit-testing on `scrolled`'s content while it is actively
+    scrolling, restoring it shortly after motion settles.
+
+    The stutter felt only when the pointer sits over content (empty space is
+    smooth) is GTK re-picking the widget under the *stationary* pointer every
+    frame as rows slide past, then re-resolving that row's `:hover` style
+    against the whole stylesheet. Freezing the CSS fade doesn't help — the cost
+    is the per-frame hover hit-test + restyle itself, which CSS can't suppress.
+
+    So we stop the picking outright: set `can-target = False` on the scrolled
+    content during the scroll, so no row is ever hovered and GTK does zero
+    per-frame hover work; restore it once motion stops. The `.is-scrolling`
+    class is still toggled (kept as a CSS-level fallback). The ScrolledWindow
+    itself stays targetable, so its own scroll/kinetic gestures and the
+    scrollbar are unaffected — only row-level hit-testing pauses. Clicks on
+    rows are suppressed for the brief settle after scrolling (and during an
+    active fling, where a press conventionally just stops the fling anyway).
+    """
+    vadjust = scrolled.get_vadjustment()
+    if vadjust is None:
+        return
+    state = {"timeout_id": 0}
+
+    def _set_content_targetable(targetable):
+        # Resolved lazily: the content child is often set on the ScrolledWindow
+        # after this helper runs, and could be swapped later.
+        child = scrolled.get_child()
+        if child is not None:
+            child.set_can_target(targetable)
+
+    def _settle():
+        state["timeout_id"] = 0
+        scrolled.remove_css_class("is-scrolling")
+        _set_content_targetable(True)
+        return GLib.SOURCE_REMOVE
+
+    def _on_value_changed(_adj):
+        if state["timeout_id"]:
+            GLib.source_remove(state["timeout_id"])
+        else:
+            scrolled.add_css_class("is-scrolling")
+            _set_content_targetable(False)
+        state["timeout_id"] = GLib.timeout_add(settle_ms, _settle)
+
+    vadjust.connect("value-changed", _on_value_changed)
 
 
 def attach_playing_highlight(row_widget, player, video_id):
@@ -837,6 +959,11 @@ class AsyncImage(Gtk.Image):
                 if url.startswith("file://"):
                     import os
                     path = url[7:]
+                    # Local cover URLs may carry an `?m=<mtime>` cache-buster
+                    # (see local_playlist_cover_url) — strip it to get the path.
+                    q = path.rfind("?")
+                    if q != -1:
+                        path = path[:q]
                     if os.path.exists(path):
                         with open(path, "rb") as f:
                             data = f.read()

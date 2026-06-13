@@ -33,6 +33,10 @@ class BasePlaylistPage(Adw.Bin):
         vadjust = scrolled.get_vadjustment()
         self.vadjust = vadjust
         vadjust.connect("value-changed", self._on_scroll)
+        # Suppress hover-background fades while scrolling — they cause stutter
+        # when the pointer sits over rows that slide past it.
+        from ui.utils import suppress_hover_while_scrolling
+        suppress_hover_while_scrolling(scrolled)
 
         # Clamp for content
         clamp = Adw.Clamp()
@@ -217,6 +221,10 @@ class BasePlaylistPage(Adw.Bin):
 
         self.songs_view = Gtk.ListView(model=self.selection_model, factory=factory)
         self.songs_view.add_css_class("boxed-list")
+        # Keyboard activation: Enter/Space on the focused row plays it. The
+        # ListView's "activate" signal passes an int position, which
+        # on_song_activated already handles (alongside the click-gesture path).
+        self.songs_view.connect("activate", self.on_song_activated)
         self.songs_view.set_visible(False)
         track_section.append(self.songs_view)
 

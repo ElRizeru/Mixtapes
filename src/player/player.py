@@ -1232,18 +1232,35 @@ class Player(GObject.Object):
         if not video_id or not working_url:
             return
 
+        def _same_cover(a, b):
+            # Treat ytimg thumbnails of the same video as the same cover even
+            # when they differ in quality (maxresdefault vs sddefault, ...).
+            # Otherwise the UI (which upgrades to maxresdefault) and the MPRIS
+            # art job (which downgrades to whatever actually fetched) keep
+            # overwriting each other's URL, and each flip re-emits
+            # metadata-changed — an infinite loop that also re-triggers a
+            # lyrics fetch every iteration (LRCLIB 429 storm).
+            if a == b:
+                return True
+            import re
+
+            ma = re.search(r"i\.ytimg\.com/vi/([^/]+)/", a or "")
+            mb = re.search(r"i\.ytimg\.com/vi/([^/]+)/", b or "")
+            return bool(ma and mb and ma.group(1) == mb.group(1))
+
         changed = False
         # Update in current queue
         for track in self.queue:
             if track.get("videoId") == video_id:
-                if track.get("thumb") != working_url:
+                if not _same_cover(track.get("thumb"), working_url):
                     track["thumb"] = working_url
                     changed = True
 
         # Update in original queue
         for track in self.original_queue:
             if track.get("videoId") == video_id:
-                track["thumb"] = working_url
+                if not _same_cover(track.get("thumb"), working_url):
+                    track["thumb"] = working_url
 
         if changed:
             # If this is the currently playing track, re-emit metadata to update MPRIS
@@ -2215,24 +2232,74 @@ class Player(GObject.Object):
         """Returns the current logical player state."""
         return self._current_logical_state
 
+    def _publish_mpris_art_pixbuf(self, pixbuf, video_id):
+        """Center-crop a pixbuf to a square and upscale small art before
+        saving it as the MPRIS cover.
+
+        Covers come in all shapes (video thumbnails are 16:9) and sizes, but
+        MPRIS wants a square — and some clients render low-res art poorly — so
+        we crop the centre square and upscale anything below MIN_ART_SIZE.
+        Saves to the art cache and points mpris_art_url at it. Returns the
+        saved path, or None if there was no pixbuf to save."""
+        if not pixbuf:
+            return None
+
+        MIN_ART_SIZE = 512
+
+        w = pixbuf.get_width()
+        h = pixbuf.get_height()
+        size = min(w, h)
+        pixbuf = pixbuf.new_subpixbuf(
+            (w - size) // 2, (h - size) // 2, size, size
+        )
+
+        if size < MIN_ART_SIZE:
+            pixbuf = pixbuf.scale_simple(
+                MIN_ART_SIZE, MIN_ART_SIZE, GdkPixbuf.InterpType.BILINEAR
+            )
+
+        cache_dir = os.path.join(GLib.get_user_cache_dir(), "mixtapes")
+        os.makedirs(cache_dir, exist_ok=True)
+
+        # Cleanup old art files to prevent bloat and cache issues
+        for old_art in glob.glob(os.path.join(cache_dir, "mpris_art_*.jpg")):
+            try:
+                os.remove(old_art)
+            except OSError:
+                pass
+
+        # Use unique filename per track to bypass MPRIS client caching
+        safe_video_id = video_id.replace("-", "_").replace(".", "_")
+        target_path = os.path.join(cache_dir, f"mpris_art_{safe_video_id}.jpg")
+
+        pixbuf.savev(target_path, "jpeg", ["quality"], ["90"])
+        self.mpris_art_url = f"file://{target_path}"
+        return target_path
+
     def _sync_mpris_art(self, url, video_id):
         """Downloads, crops, and saves artwork locally for MPRIS with fallback support."""
-        # Try local cover first (works offline)
-        if video_id:
-            local_path = self.download_manager.get_local_path(video_id)
-            if local_path:
-                import os as _os
-
-                cover = _os.path.join(_os.path.dirname(local_path), "cover.jpg")
-                if _os.path.exists(cover):
-                    self.mpris_art_url = f"file://{cover}"
-                    if hasattr(self, "mpris_events"):
-                        self.mpris_events.on_title()
-                    return
-        if not url:
-            return
-
         def job(current_url, fallbacks=None):
+            # Try local cover first (works offline). Downloads embed the cover
+            # in the audio file's tags (no sidecar cover.jpg), so reuse the
+            # UI's extractor which pulls the embedded art into the cover cache
+            # and returns a file:// URL. The cold path reads the audio file +
+            # writes a JPEG, so it must stay off the main thread.
+            if video_id and self.current_video_id == video_id:
+                from ui.utils import resolve_local_cover
+
+                local_cover = resolve_local_cover(video_id)
+                if local_cover:
+                    try:
+                        path = local_cover[len("file://"):]
+                        pixbuf = GdkPixbuf.Pixbuf.new_from_file(path)
+                        if self._publish_mpris_art_pixbuf(pixbuf, video_id):
+                            if hasattr(self, "mpris_events"):
+                                GLib.idle_add(self.mpris_events.on_player_all)
+                            return
+                    except Exception as e:
+                        # Fall through to the network path on any failure.
+                        print(f"[PLAYER] MPRIS local art failed: {e}")
+
             if not current_url or self.current_video_id != video_id:
                 return
 
@@ -2271,42 +2338,13 @@ class Player(GObject.Object):
                 resp.raise_for_status()
                 data = resp.content
 
-                # 2. Load and Crop
+                # 2. Load, crop and upscale
                 loader = GdkPixbuf.PixbufLoader()
                 loader.write(data)
                 loader.close()
                 pixbuf = loader.get_pixbuf()
 
-                if pixbuf:
-                    w = pixbuf.get_width()
-                    h = pixbuf.get_height()
-                    size = min(w, h)
-                    pixbuf = pixbuf.new_subpixbuf(
-                        (w - size) // 2, (h - size) // 2, size, size
-                    )
-
-                    # 3. Save to cache
-                    cache_dir = os.path.join(GLib.get_user_cache_dir(), "mixtapes")
-                    os.makedirs(cache_dir, exist_ok=True)
-
-                    # Cleanup old art files to prevent bloat and cache issues
-                    for old_art in glob.glob(
-                        os.path.join(cache_dir, "mpris_art_*.jpg")
-                    ):
-                        try:
-                            os.remove(old_art)
-                        except:
-                            pass
-
-                    # Use unique filename per track to bypass MPRIS client caching
-                    safe_video_id = video_id.replace("-", "_").replace(".", "_")
-                    target_path = os.path.join(
-                        cache_dir, f"mpris_art_{safe_video_id}.jpg"
-                    )
-
-                    pixbuf.savev(target_path, "jpeg", ["quality"], ["90"])
-                    self.mpris_art_url = f"file://{target_path}"
-
+                if self._publish_mpris_art_pixbuf(pixbuf, video_id):
                     # 4. Notify MPRIS to refresh metadata with the NEW local URL
                     if hasattr(self, "mpris_events"):
                         GLib.idle_add(self.mpris_events.on_player_all)

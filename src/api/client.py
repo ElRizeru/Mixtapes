@@ -1638,12 +1638,41 @@ class MusicClient:
         for source_name, fetcher_attr, takes_vid_only in self._LYRIC_PROVIDERS:
             if source_name in cached_sources:
                 continue
+            if not self._lyrics_provider_ready(fetcher_attr):
+                continue
             t = threading.Thread(
                 target=_runner,
                 args=(source_name, fetcher_attr, takes_vid_only),
                 daemon=True,
             )
             t.start()
+
+    def _lyrics_provider_ready(self, key):
+        """False while a provider is in a back-off window. A source that
+        just returned HTTP 429 or kept timing out is skipped for all tracks
+        until the window expires, instead of being re-hit on every track
+        change (which only deepens the rate-limit / timeout spiral)."""
+        import time
+
+        cooldowns = getattr(self, "_lyrics_cooldowns", None)
+        if not cooldowns:
+            return True
+        return time.monotonic() >= cooldowns.get(key, 0)
+
+    def _trip_lyrics_cooldown(self, key, seconds, reason=""):
+        """Stop calling a lyrics provider for ``seconds`` after it signals
+        it's overloaded (HTTP 429) or unreachable (timeouts)."""
+        import time
+
+        cooldowns = getattr(self, "_lyrics_cooldowns", None)
+        if cooldowns is None:
+            cooldowns = {}
+            self._lyrics_cooldowns = cooldowns
+        deadline = time.monotonic() + seconds
+        # Never let a fresh short cooldown shorten a longer active one.
+        if deadline > cooldowns.get(key, 0):
+            cooldowns[key] = deadline
+            print(f"[LYRICS] backing off {key} for {seconds}s ({reason})")
 
     def _run_lyrics_chain(self, video_id, title, artist, duration):
         """Walk the provider chain in priority order, returning the
@@ -1676,6 +1705,8 @@ class MusicClient:
             (self._fetch_lyrics_ytm, [(video_id,)], 1),
         ]:
             if best_rank >= target_rank:
+                continue
+            if not self._lyrics_provider_ready(fetcher.__name__):
                 continue
             for args in args_list:
                 res = fetcher(*args)
@@ -1919,6 +1950,11 @@ class MusicClient:
         headers = {"User-Agent": "Mixtapes (https://github.com/m-obeid/Mixtapes)"}
 
         def _hit(path, params):
+            # Once a 429/timeout has tripped the cooldown, skip the remaining
+            # /get and /search probes (and any later title variants) instead
+            # of firing them into a server that just told us to back off.
+            if not self._lyrics_provider_ready("_fetch_lyrics_lrclib"):
+                return None
             url = "https://lrclib.net/api/" + path + "?" + urllib.parse.urlencode(params)
             try:
                 req = urllib.request.Request(url, headers=headers)
@@ -1928,10 +1964,18 @@ class MusicClient:
                 with urllib.request.urlopen(req, timeout=3) as resp:
                     return _json.loads(resp.read())
             except urllib.error.HTTPError as e:
-                if e.code != 404:
+                if e.code == 429:
+                    self._trip_lyrics_cooldown(
+                        "_fetch_lyrics_lrclib", 120, "HTTP 429"
+                    )
+                elif e.code != 404:
                     print(f"[LYRICS] LRCLIB HTTP {e.code}: {e.reason} for {path}")
                 return None
             except Exception as e:
+                if "timed out" in str(e).lower():
+                    self._trip_lyrics_cooldown(
+                        "_fetch_lyrics_lrclib", 60, "timeout"
+                    )
                 print(f"[LYRICS] LRCLIB fetch failed: {e}")
                 return None
 

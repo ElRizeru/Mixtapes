@@ -340,6 +340,10 @@ class HomePage(Adw.Bin):
 
         feed_scroll = Gtk.ScrolledWindow()
         feed_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        # Suppress hover-background fades while scrolling — they cause stutter
+        # when the pointer sits over cards/rows that slide past it.
+        from ui.utils import suppress_hover_while_scrolling
+        suppress_hover_while_scrolling(feed_scroll)
         feed_clamp = Adw.Clamp()
         feed_clamp.set_maximum_size(1024)
         feed_clamp.set_tightening_threshold(600)
@@ -875,7 +879,33 @@ class HomePage(Adw.Bin):
         )
         card.add_controller(lp)
 
+        # Keyboard accessibility: these cards are plain Gtk.Box widgets driven
+        # by click gestures, so without this they were unreachable by Tab and
+        # un-activatable from the keyboard. Make them focusable, expose a label
+        # to assistive tech, and activate on Enter/Space (mirroring a click).
+        card.set_focusable(True)
+        card.update_property(
+            [Gtk.AccessibleProperty.LABEL], [item.get("title", "")]
+        )
+        key = Gtk.EventControllerKey()
+        key.connect("key-pressed", self._on_card_key, card)
+        card.add_controller(key)
+
         return card
+
+    def _on_card_key(self, controller, keyval, keycode, state, card):
+        if keyval in (
+            Gdk.KEY_Return,
+            Gdk.KEY_KP_Enter,
+            Gdk.KEY_ISO_Enter,
+            Gdk.KEY_space,
+            Gdk.KEY_KP_Space,
+        ):
+            self._activate_item(
+                card.item_data, card.item_kind, getattr(card, "queue_pool", None)
+            )
+            return True
+        return False
 
     # ─── Subtitle row with kind icon + detail ──────────────────────────────
 

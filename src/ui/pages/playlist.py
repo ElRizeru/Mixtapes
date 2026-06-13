@@ -1,5 +1,6 @@
 import threading
 import os
+import shutil
 import tempfile
 from gi.repository import Gtk, Adw, GObject, GLib, Pango, Gdk, Gio, GdkPixbuf
 from api.client import MusicClient
@@ -389,12 +390,20 @@ class PlaylistPage(Adw.Bin):
 
         self.songs_list = Gtk.ListView.new(self.selection_model, factory)
         self.songs_list.add_css_class("playlist-view")
+        # Keyboard activation: Enter/Space on the focused row plays it. Mouse
+        # clicks go through the per-row gesture (see _setup_list_item); the
+        # ListView "activate" signal covers keyboard (and double-click).
+        self.songs_list.connect("activate", self._on_list_activate)
 
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scrolled.set_vexpand(True)
         self.vadjust = scrolled.get_vadjustment()
         self.vadjust.connect("value-changed", self._on_scroll)
+        # Suppress hover-background fades while scrolling — they cause stutter
+        # when the pointer sits over rows that slide past it.
+        from ui.utils import suppress_hover_while_scrolling
+        suppress_hover_while_scrolling(scrolled)
 
         clamp = (
             Adw.ClampScrollable() if hasattr(Adw, "ClampScrollable") else Adw.Clamp()
@@ -844,6 +853,31 @@ class PlaylistPage(Adw.Bin):
             return
 
         track = getattr(row, "_lv_full_track", None)
+        self._play_track(track)
+
+    def _on_list_activate(self, listview, position):
+        """Keyboard (Enter/Space) activation of the focused row. The activate
+        signal gives a position into the flattened model; resolve it to a track
+        and route through the same play path as a mouse click."""
+        item = self.flatten_model.get_item(position)
+        if item is None or type(item).__name__ == "HeaderItem":
+            return
+        track = item.data
+        # Mirror the click path: in multi-select mode, toggle instead of play.
+        # _toggle_track_selection tolerates row=None (the checkbox repaints when
+        # the row next rebinds), so we don't need the realized widget here.
+        if self._multi_select_mode:
+            vid = track.get("videoId") if track else None
+            self._toggle_track_selection(vid)
+            # _toggle_track_selection only repaints when handed the row widget;
+            # we don't have it here, so sync the realized rows' checkboxes.
+            self._refresh_all_row_visuals()
+            return
+        self._play_track(track)
+
+    def _play_track(self, track):
+        """Queue `track`'s playlist and start playback from it. Shared by the
+        row-click gesture and keyboard activation."""
         if not track or not track.get("videoId"):
             return
 
@@ -854,7 +888,7 @@ class PlaylistPage(Adw.Bin):
         if not is_online() and not self.player.download_manager.is_downloaded(video_id):
             return
 
-        # Use the same queue the big Play button uses so clicking a track
+        # Use the same queue the big Play button uses so playing a track
         # respects the user's chosen sort + direction. Falling back to
         # `original_tracks` unconditionally would always queue the
         # playlist's default order, even when the user has sorted by
@@ -874,7 +908,7 @@ class PlaylistPage(Adw.Bin):
                 break
 
         if start_index < 0:
-            # Click target wasn't in tracks_to_queue (shouldn't happen, but
+            # Target wasn't in tracks_to_queue (shouldn't happen, but
             # don't silently fall back to playing the first song).
             return
 
@@ -1399,16 +1433,8 @@ class PlaylistPage(Adw.Bin):
                 # save_playlist_cover_async), and an extra HTTPS round-trip
                 # here is one of the biggest visual stalls on big-playlist
                 # open — initial_data.title is what the cover file is keyed by.
-                local_cover = None
-                title_for_cover = initial_data.get("title")
-                if title_for_cover:
-                    from player.downloads import get_music_dir, _sanitize_filename
-                    candidate = os.path.join(
-                        get_music_dir(), "Playlists",
-                        f"{_sanitize_filename(title_for_cover)}.jpg",
-                    )
-                    if os.path.exists(candidate):
-                        local_cover = f"file://{candidate}"
+                from ui.utils import local_playlist_cover_url
+                local_cover = local_playlist_cover_url(initial_data.get("title"))
                 cover_url = local_cover or thumb
                 if self.cover_img.url != cover_url:
                     self.cover_img.set_from_icon_name("media-playlist-audio-symbolic")
@@ -1622,15 +1648,9 @@ class PlaylistPage(Adw.Bin):
                 url = thumbnails[-1]["url"]
                 if self.cover_img.url != url:
                     self._is_previewing_cover = False
-                    from player.downloads import get_music_dir, _sanitize_filename
-                    cover_path = os.path.join(
-                        get_music_dir(), "Playlists",
-                        f"{_sanitize_filename(title)}.jpg",
-                    )
-                    if os.path.exists(cover_path):
-                        self.cover_img.load_url(f"file://{cover_path}")
-                    else:
-                        self.cover_img.load_url(url)
+                    from ui.utils import local_playlist_cover_url
+                    local_cover = local_playlist_cover_url(title)
+                    self.cover_img.load_url(local_cover or url)
         except Exception as e:
             print(f"[DISK-CACHE] header apply failed: {e}")
         return False
@@ -2350,15 +2370,10 @@ class PlaylistPage(Adw.Bin):
                 # connectivity — it's instant, and the network thumbnail
                 # would overwrite it anyway if we left it as the initial
                 # source.
-                from player.downloads import get_music_dir, _sanitize_filename
+                from ui.utils import local_playlist_cover_url
 
-                cover_path = os.path.join(
-                    get_music_dir(), "Playlists", f"{_sanitize_filename(title)}.jpg"
-                )
-                if os.path.exists(cover_path):
-                    self.cover_img.load_url(f"file://{cover_path}")
-                else:
-                    self.cover_img.load_url(url)
+                local_cover = local_playlist_cover_url(title)
+                self.cover_img.load_url(local_cover or url)
                 # Always refresh the on-disk cover so edits on YT propagate.
                 # The helper itself skips video-thumbnail URLs.
                 self._save_playlist_cover_async(title, url)
@@ -3778,6 +3793,29 @@ class PlaylistPage(Adw.Bin):
                         success = self.client.set_playlist_thumbnail(
                             self.playlist_id, img_path
                         )
+                        # Mirror the new cover into the local cache keyed by
+                        # title. Without this the on-disk Playlists/<title>.jpg
+                        # keeps the old art (the freshness gate blocks a re-
+                        # download for a day), so the library grid and a
+                        # re-opened playlist page would both show the stale
+                        # cover. The rewrite bumps the file's mtime, which busts
+                        # the mtime-keyed pixbuf cache on the next load.
+                        try:
+                            from ui.utils import playlist_cover_path
+
+                            dst = playlist_cover_path(clean_title or old_title)
+                            if dst:
+                                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                                shutil.copyfile(img_path, dst)
+                                # Drop the identity sidecar so the next library
+                                # load re-syncs from YT (which now hosts this
+                                # art) rather than trusting the stale identity.
+                                try:
+                                    os.remove(dst + ".url")
+                                except OSError:
+                                    pass
+                        except Exception as e:
+                            print(f"[COVER] local mirror failed: {e}")
 
                     # Refresh
                     # Clear cache and then reload
