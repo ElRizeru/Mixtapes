@@ -62,6 +62,14 @@ class Visualizer(Gtk.DrawingArea):
     # Real music's energy rolls off sharply with frequency — at 1.8, the
     # rightmost bar gets ~2.8× gain so treble reads as visibly as bass.
     HIGH_FREQ_BOOST = 1.8
+    # Contrast expansion. The dB→[0,1] mapping is heavily compressed (a
+    # -30 dB band still lands at ~0.6), so without this every bar clusters
+    # at a similar mid height — a flat carpet instead of CAVA's tall peaks
+    # and deep valleys. Raising the normalized value to this power pushes
+    # quiet bands down hard while autosens pulls the loudest back to the
+    # top, restoring per-bar contrast. ~2.5 ≈ CAVA's linear-amplitude feel;
+    # higher = sparser/spikier, lower = flatter.
+    CONTRAST_GAMMA = 2.5
     # Auto-sensitivity: track a slowly-decaying recent peak so quiet
     # passages still fill the row. Without this, bars are stuck low
     # whenever the song isn't at peak loudness.
@@ -188,11 +196,19 @@ class Visualizer(Gtk.DrawingArea):
                 out.append(0.0)
             else:
                 norm = (peak_db - threshold) / -threshold
+                # Expand dynamic range before the treble boost (see
+                # CONTRAST_GAMMA): turns the flat mid-height carpet into
+                # distinct peaks and valleys.
+                norm = norm ** self.CONTRAST_GAMMA
                 # Per-band amplification: treble gets a multiplicative boost
                 # so the right half of the row isn't constantly anemic
-                # compared to the bass.
+                # compared to the bass. Deliberately NOT clamped to 1.0 here:
+                # the auto-sensitivity stage needs to see the true peak (which
+                # may exceed 1.0 after the boost) so it can scale the whole row
+                # down to fit. Clamping here would hide that headroom and pin
+                # loud bands at the top permanently.
                 norm *= self._weights[idx]
-                out.append(min(1.0, norm))
+                out.append(max(0.0, norm))
         return out
 
     # ─── Monstercat-style cross-bar smoothing ──────────────────────────────
@@ -241,9 +257,16 @@ class Visualizer(Gtk.DrawingArea):
         decayed = self._recent_max * self.AUTO_GAIN_DECAY
         self._recent_max = max(frame_peak, decayed)
         if self._recent_max > self.AUTO_GAIN_FLOOR:
+            # Bidirectional auto-sensitivity (CAVA-style autosens): scale the
+            # whole row so the slowly-decaying recent peak lands at
+            # AUTO_GAIN_TARGET. This both amplifies quiet passages AND
+            # attenuates loud ones — the latter is what keeps the bars from
+            # pinning at the top during normal-loudness music. Clamp once,
+            # here, after the scaling.
             gain = min(self.AUTO_GAIN_MAX, self.AUTO_GAIN_TARGET / self._recent_max)
-            if gain > 1.0:
-                bars = [min(1.0, b * gain) for b in bars]
+            bars = [min(1.0, b * gain) for b in bars]
+        else:
+            bars = [min(1.0, b) for b in bars]
 
         bars = self._smooth(bars)
 
