@@ -1411,15 +1411,13 @@ class MainWindow(Adw.ApplicationWindow):
         page = HistoryPage(self.player)
         if getattr(self, "_is_compact", False):
             page.set_compact_mode(True)
-        # Paint cached rows BEFORE the push so the pushed page arrives
-        # already populated — otherwise the forward-nav slide shows a
-        # blank surface for the 350ms until the fresh fetch lands.
-        page.load_cached()
         nav_page = Adw.NavigationPage(child=page, title="Listening History")
+
+        def _on_shown(p):
+            page.load()
+
+        nav_page.connect("shown", _on_shown)
         nav.push(nav_page)
-        # Fresh fetch runs after the transition so it doesn't compete
-        # for frame time with the slide animation.
-        page.refresh_from_server(delay_ms=350)
 
     def _open_downloads_from_menu(self):
         """Push the Downloads PlaylistPage onto the visible tab's nav
@@ -1436,6 +1434,11 @@ class MainWindow(Adw.ApplicationWindow):
         if getattr(self, "_is_compact", False):
             page.set_compact_mode(True)
         nav_page = Adw.NavigationPage(child=page, title="Downloaded Songs")
+
+        def _on_shown(page):
+            threading.Thread(target=_fetch, daemon=True).start()
+
+        nav_page.connect("shown", _on_shown)
         nav.push(nav_page)
         page.stack.set_visible_child_name("loading")
 
@@ -1464,8 +1467,6 @@ class MainWindow(Adw.ApplicationWindow):
                     t["duration"] = f"{dur // 60}:{dur % 60:02d}"
                 tracks.append(t)
             GLib.idle_add(self._fill_downloads_page, page, tracks)
-
-        threading.Thread(target=_fetch, daemon=True).start()
 
     def _fill_downloads_page(self, page, tracks):
         page.original_tracks = tracks
@@ -2642,11 +2643,14 @@ class MainWindow(Adw.ApplicationWindow):
         # Adw.NavigationPage expects a child widget.
         nav_page = Adw.NavigationPage(child=playlist_page, title="Playlist")
 
+        # Load data
+        def _on_shown(page):
+            playlist_page.load_playlist(playlist_id, initial_data)
+
+        nav_page.connect("shown", _on_shown)
+
         # Push to stack
         active_nav.push(nav_page)
-
-        # Load data
-        playlist_page.load_playlist(playlist_id, initial_data)
 
         # Connect title change signal
         playlist_page.connect(
