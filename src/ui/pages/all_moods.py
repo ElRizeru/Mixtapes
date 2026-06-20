@@ -100,5 +100,5 @@ class AllMoodsPage(Adw.Bin):
         if "params" in item:
             root = self.get_root()
             if hasattr(root, "open_category"):
-                nav_title = item.get("title", "Category")
+                nav_title = item.get("title", self.category_title)
                 root.open_category(item["params"], nav_title)

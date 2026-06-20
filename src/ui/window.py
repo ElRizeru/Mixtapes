@@ -2674,7 +2674,7 @@ class MainWindow(Adw.ApplicationWindow):
         # PlaylistPage already has a ToolbarView/Header internally.
         # Adw.NavigationView expects Adw.NavigationPage.
         # Adw.NavigationPage expects a child widget.
-        nav_page = Adw.NavigationPage(child=playlist_page, title="Playlist")
+        nav_page = Adw.NavigationPage(child=playlist_page, title=f"Playlist_{playlist_id}")
 
         # Load data
         def _on_shown(page):
@@ -2737,7 +2737,7 @@ class MainWindow(Adw.ApplicationWindow):
         artist_page = ArtistPage(self.player, self.open_playlist)
 
         nav_page = Adw.NavigationPage(
-            child=artist_page, title=initial_name if initial_name else "Artist"
+            child=artist_page, title=initial_name if initial_name else f"Artist_{channel_id}"
         )
 
         active_nav.push(nav_page)
