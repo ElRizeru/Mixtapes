@@ -98,7 +98,7 @@ class CategoryPage(Adw.Bin):
         child = self.content_box.get_first_child()
         while child:
             next_child = child.get_next_sibling()
-            if child != self.loading_spinner and child != self.page_title_label:
+            if child != self._loading_wrap and child != self.page_title_label:
                 self.content_box.remove(child)
             child = next_child
 
