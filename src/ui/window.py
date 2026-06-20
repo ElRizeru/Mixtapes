@@ -2422,6 +2422,39 @@ class MainWindow(Adw.ApplicationWindow):
         self._avatar_channel_btn.set_sensitive(False)
 
     def init_pages(self):
+
+        # patching Adw.NavigationView's push() to not push into the same page as the current visible page
+        # takes the original push() function, and replaces it with additional checks before calling the original push() function
+        if not getattr(Adw.NavigationView, '_push_patched', False):
+            original_push = Adw.NavigationView.push
+
+            # if both pages have tags, the patch_push checks if the tags between the visible page and the page to push
+            # if the tags are the same, then no push is called
+            #
+            # if tag checks is invalid, then the patch_push checkes the title
+            # if titles are the same, then no push is called
+            def patch_push(self, page):
+                current = self.get_visible_page()
+
+                if current is None:
+                    original_push(self, page)
+                    return
+                
+                current_tag = current.get_tag()
+                page_tag = page.get_tag()
+                if current_tag is not None and page_tag is not None and current_tag != page_tag:
+                    original_push(self, page)
+                    return
+
+                current_title = current.get_title()
+                page_title = page.get_title()
+                
+                if current_title != page_title:
+                    original_push(self, page)
+
+            Adw.NavigationView.push = patch_push
+            Adw.NavigationView._push_patched = True
+    
         # PlaylistPage imported at top level now
 
         # Create Pages
