@@ -5,6 +5,7 @@ from gi.repository import Gtk, Adw, GLib, Gio, Gdk, GObject, Pango
 
 from api.client import MusicClient
 from ui.utils import AsyncPicture, LikeButton
+from ui.util_classes import ScrolledWindow
 
 
 class HistoryPage(Adw.Bin):
@@ -35,7 +36,7 @@ class HistoryPage(Adw.Bin):
         self.main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.set_child(self.main_box)
 
-        self.scrolled = Gtk.ScrolledWindow()
+        self.scrolled = ScrolledWindow()
         self.scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         self.scrolled.set_vexpand(True)
 

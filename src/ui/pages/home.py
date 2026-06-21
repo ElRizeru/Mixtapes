@@ -9,6 +9,7 @@ from ui.utils import (
     attach_playing_highlight,
 )
 from ui.widgets.scroll_box import HorizontalScrollBox
+from ui.util_classes import ScrolledWindow
 
 
 CARD_SIZE = 160
@@ -338,12 +339,8 @@ class HomePage(Adw.Bin):
         loading_box.append(loading_label)
         self.stack.add_named(loading_box, "loading")
 
-        feed_scroll = Gtk.ScrolledWindow()
+        feed_scroll = ScrolledWindow()
         feed_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        # Suppress hover-background fades while scrolling — they cause stutter
-        # when the pointer sits over cards/rows that slide past it.
-        from ui.utils import suppress_hover_while_scrolling
-        suppress_hover_while_scrolling(feed_scroll)
         feed_clamp = Adw.Clamp()
         feed_clamp.set_maximum_size(1024)
         feed_clamp.set_tightening_threshold(600)

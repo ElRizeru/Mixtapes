@@ -4,6 +4,7 @@ import threading
 from api.client import MusicClient
 from ui.utils import AsyncImage, parse_item_metadata
 from ui.widgets.scroll_box import HorizontalScrollBox
+from ui.util_classes import ScrolledWindow
 
 class CategoryPage(Adw.Bin):
     __gsignals__ = {
@@ -26,7 +27,7 @@ class CategoryPage(Adw.Bin):
         self.main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
 
         # Scrolled Window
-        self.scrolled = Gtk.ScrolledWindow()
+        self.scrolled = ScrolledWindow()
         self.scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         self.scrolled.set_vexpand(True)
 

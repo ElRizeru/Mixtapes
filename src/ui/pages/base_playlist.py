@@ -5,6 +5,7 @@ from api.client import MusicClient
 from ui.utils import AsyncImage, LikeButton, get_yt_music_link, show_toast
 from ui.models.song import SongItem
 from ui.widgets.song_row import SongRowWidget
+from ui.util_classes import ScrolledWindow
 
 
 class BasePlaylistPage(Adw.Bin):
@@ -25,7 +26,7 @@ class BasePlaylistPage(Adw.Bin):
         self.main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
 
         # Content Scrolled Window
-        scrolled = Gtk.ScrolledWindow()
+        scrolled = ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scrolled.set_vexpand(True)
 
@@ -33,10 +34,6 @@ class BasePlaylistPage(Adw.Bin):
         vadjust = scrolled.get_vadjustment()
         self.vadjust = vadjust
         vadjust.connect("value-changed", self._on_scroll)
-        # Suppress hover-background fades while scrolling — they cause stutter
-        # when the pointer sits over rows that slide past it.
-        from ui.utils import suppress_hover_while_scrolling
-        suppress_hover_while_scrolling(scrolled)
 
         # Clamp for content
         clamp = Adw.Clamp()

@@ -3,6 +3,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Gtk, Adw, GObject, Pango, Gdk, Gio
+from ui.util_classes import ScrolledWindow
 
 
 class QueueItem(GObject.Object):
@@ -181,7 +182,7 @@ class QueuePopover(Gtk.Popover):
 
         self.list_view = Gtk.ListView(model=self.selection_model, factory=factory)
 
-        scrolled = Gtk.ScrolledWindow()
+        scrolled = ScrolledWindow()
         scrolled.set_vexpand(True)
         scrolled.set_child(self.list_view)
         box.append(scrolled)

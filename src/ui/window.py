@@ -9,6 +9,8 @@ gi.require_version("Adw", "1")
 
 from gi.repository import Gtk, Gdk, Adw, GObject, Gio, GLib, Pango
 from player.player import Player
+from ui.util_classes import ScrolledWindow
+
 
 HAS_TRAY = False
 if sys.platform == "win32":
@@ -336,7 +338,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._dl_popover = Gtk.Popover()
         self._dl_popover.set_size_request(300, -1)
         self._dl_popover.set_parent(self._download_progress_btn)
-        dl_scroll = Gtk.ScrolledWindow()
+        dl_scroll = ScrolledWindow()
         dl_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         dl_scroll.set_max_content_height(400)
         dl_scroll.set_propagate_natural_height(True)
@@ -427,7 +429,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.main_stack.set_transition_duration(300)
 
         # Main Content Area (Scrolled Browser)
-        self.content_bin = Gtk.ScrolledWindow()
+        self.content_bin = ScrolledWindow()
         self.content_bin.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
         self.content_bin.set_child(self.view_stack)
 

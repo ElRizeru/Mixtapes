@@ -7,6 +7,7 @@ from ui.utils import (
     AsyncImage, AsyncPicture, LikeButton, parse_item_metadata,
     attach_playing_highlight,
 )
+from ui.util_classes import ScrolledWindow
 
 
 class ArtistPage(Adw.Bin):
@@ -34,7 +35,7 @@ class ArtistPage(Adw.Bin):
         self.main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
 
         # Content Scrolled Window
-        scrolled = Gtk.ScrolledWindow()
+        scrolled = ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scrolled.set_vexpand(True)
 

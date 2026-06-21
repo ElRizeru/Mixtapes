@@ -3,6 +3,7 @@ from gi.repository import Gtk, Adw, GObject, GLib, Pango, Gdk, Gio
 from ui.utils import AsyncPicture, LikeButton, MarqueeLabel, show_toast
 from ui.queue_panel import QueuePanel
 from ui.widgets.lyrics_view import LyricsView
+from ui.util_classes import ScrolledWindow
 
 
 class ExpandedPlayer(Gtk.Box):
@@ -49,7 +50,7 @@ class ExpandedPlayer(Gtk.Box):
         # ==========================================
         # PAGE 1: THE PLAYER VIEW
         # ==========================================
-        self.player_scroll = Gtk.ScrolledWindow()
+        self.player_scroll = ScrolledWindow()
         self.player_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         self.player_scroll.set_propagate_natural_height(True)
 

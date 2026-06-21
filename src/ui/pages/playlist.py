@@ -6,6 +6,7 @@ from gi.repository import Gtk, Adw, GObject, GLib, Pango, Gdk, Gio, GdkPixbuf
 from api.client import MusicClient
 from ui.utils import AsyncImage, LikeButton, get_yt_music_link, show_toast
 from ui.crop_dialog import ImageCropDialog
+from ui.util_classes import ScrolledWindow
 
 # ── GObject Models ────────────────────────────────────────────────────────────
 
@@ -395,15 +396,11 @@ class PlaylistPage(Adw.Bin):
         # ListView "activate" signal covers keyboard (and double-click).
         self.songs_list.connect("activate", self._on_list_activate)
 
-        scrolled = Gtk.ScrolledWindow()
+        scrolled = ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scrolled.set_vexpand(True)
         self.vadjust = scrolled.get_vadjustment()
         self.vadjust.connect("value-changed", self._on_scroll)
-        # Suppress hover-background fades while scrolling — they cause stutter
-        # when the pointer sits over rows that slide past it.
-        from ui.utils import suppress_hover_while_scrolling
-        suppress_hover_while_scrolling(scrolled)
 
         clamp = (
             Adw.ClampScrollable() if hasattr(Adw, "ClampScrollable") else Adw.Clamp()

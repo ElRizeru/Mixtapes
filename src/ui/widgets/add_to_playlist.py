@@ -9,6 +9,7 @@ import threading
 import time
 
 from gi.repository import Gtk, GLib, Gdk
+from ui.util_classes import ScrolledWindow
 
 # CSS provider for this widget — installed once into the default display so
 # every popover instance picks up the styling. Keeps the rounding subtle and
@@ -123,7 +124,7 @@ class AddToPlaylistPopover(Gtk.Popover):
         # ScrolledWindow with a capped height — natural height grows with the
         # list up to max_content_height, then scrolls. Without the cap, a
         # user with 200 playlists got a popover taller than their screen.
-        scrolled = Gtk.ScrolledWindow()
+        scrolled = ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scrolled.set_propagate_natural_height(True)
         scrolled.set_min_content_height(120)
