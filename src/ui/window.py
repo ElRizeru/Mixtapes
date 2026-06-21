@@ -2434,27 +2434,29 @@ class MainWindow(Adw.ApplicationWindow):
             # if tag checks is invalid, then the patch_push checkes the title
             # if titles are the same, then no push is called
             def patch_push(self, page):
+                def tag_diff(page_a, page_b) -> bool:
+                    tag_a = page_a.get_tag()
+                    tag_b = page_b.get_tag()
+                    return tag_a != None and tag_b != None and tag_a != tag_b
+                
+                def title_match(page_a, page_b) -> bool:
+                    title_a = page_a.get_title()
+                    title_b = page_b.get_title()
+                    return title_a == title_b
+
                 current = self.get_visible_page()
 
                 if current is None:
                     original_push(self, page)
                     return
                 
-                current_tag = current.get_tag()
-                page_tag = page.get_tag()
-                if current_tag is not None and page_tag is not None and current_tag != page_tag:
+                if tag_diff(current, page) or not title_match(current, page):
                     original_push(self, page)
                     return
 
-                current_title = current.get_title()
-                page_title = page.get_title()
-                
-                if current_title != page_title:
-                    original_push(self, page)
-
             Adw.NavigationView.push = patch_push
             Adw.NavigationView._push_patched = True
-    
+
         # PlaylistPage imported at top level now
 
         # Create Pages
@@ -2471,6 +2473,29 @@ class MainWindow(Adw.ApplicationWindow):
 
             # Connect to page changes to update Back Button
             nav_view.connect("notify::visible-page", self.update_back_button_visibility)
+
+            def on_push(nav_view):
+                def tag_match(page_a, page_b) -> bool:
+                    tag_a = page_a.get_tag()
+                    tag_b = page_b.get_tag()
+                    return tag_a != None and tag_b != None and tag_a == tag_b
+                
+                def title_match(page_a, page_b) -> bool:
+                    title_a = page_a.get_title()
+                    title_b = page_b.get_title()
+                    return title_a == title_b
+
+                stack = list(nav_view.get_navigation_stack())
+                current_page = nav_view.get_visible_page()
+
+                # just removing the first matching page should be enough 
+                # because there shouldnt be more than one that exists in the current stack
+                for i, p in enumerate(stack[:max(len(stack)-1, 0)]):
+                    if tag_match(p, current_page) or title_match(p, current_page):
+                        nav_view.replace(stack[:i] + stack[i+1:])
+                        return
+
+            nav_view.connect("pushed", on_push)
 
             return nav_view
 
