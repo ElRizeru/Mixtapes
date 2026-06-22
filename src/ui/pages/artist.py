@@ -1,5 +1,6 @@
 from gi.repository import Gtk, Adw, GObject, GLib, Pango, Gdk, Gio
 import threading
+import weakref
 import json
 import re
 from api.client import MusicClient
@@ -17,6 +18,8 @@ class ArtistPage(Adw.Bin):
     def __init__(self, player, open_playlist_callback, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.player = player
+        weak_self = weakref.ref(self)
+        self.connect("destroy", lambda w: weak_self()._on_page_destroy(w) if weak_self() else None)
         self.open_playlist_callback = open_playlist_callback
         self.client = MusicClient()
         self.artist_name = ""
@@ -41,7 +44,9 @@ class ArtistPage(Adw.Bin):
         # Monitor scroll for title
         vadjust = scrolled.get_vadjustment()
         self.vadjust = vadjust
-        vadjust.connect("value-changed", self._on_scroll)
+        self._scroll_handler_id = vadjust.connect(
+            "value-changed", lambda adj: weak_self()._on_scroll(adj) if weak_self() else None
+        )
 
         # Main Clamp
         self.clamp = Adw.Clamp()
@@ -90,30 +95,37 @@ class ArtistPage(Adw.Bin):
         # opaque (would paint a solid band over the blur), so we mask
         # the image itself to alpha 0 instead. Re-check on every realize
         # plus on a notify::css-classes from the root window.
+        weak_self = weakref.ref(self)
         def _sync_banner_fade(*_):
-            root = self.banner_wrapper.get_root()
+            s = weak_self()
+            if not s:
+                return
+            root = s.banner_wrapper.get_root()
             classes = list(root.get_css_classes()) if root else []
             active = "cover-bg-active" in classes
             print(
                 f"[FADE-SYNC] root={type(root).__name__ if root else None}"
                 f" classes={classes} active={active}"
             )
-            self.banner_wrapper.set_fade_active(active)
+            s.banner_wrapper.set_fade_active(active)
 
         self._sync_banner_fade = _sync_banner_fade
         self._banner_fade_root_handler = None
 
         def _hook_root(*_):
-            root = self.banner_wrapper.get_root()
-            if root and self._banner_fade_root_handler is None:
-                self._banner_fade_root_handler = root.connect(
+            s = weak_self()
+            if not s:
+                return
+            root = s.banner_wrapper.get_root()
+            if root and s._banner_fade_root_handler is None:
+                s._banner_fade_root_handler = root.connect(
                     "notify::css-classes", _sync_banner_fade
                 )
             _sync_banner_fade()
 
-        self.banner_wrapper.connect("realize", _hook_root)
+        self.banner_wrapper.connect("realize", lambda *_: _hook_root())
         self.banner_wrapper.connect(
-            "map", lambda *_: GLib.idle_add(_hook_root)
+            "map", lambda *_: GLib.idle_add(lambda: _hook_root())
         )
 
         # Visual Scrim
@@ -166,7 +178,7 @@ class ArtistPage(Adw.Bin):
         self.play_btn = Gtk.Button(label="Play")
         self.play_btn.add_css_class("suggested-action")
         self.play_btn.add_css_class("pill")
-        self.play_btn.connect("clicked", self.on_play_clicked)
+        self.play_btn.connect("clicked", lambda btn: weak_self().on_play_clicked(btn) if weak_self() else None)
         actions.append(self.play_btn)
 
         self.shuffle_btn = Gtk.Button()
@@ -175,7 +187,7 @@ class ArtistPage(Adw.Bin):
         self.shuffle_btn.set_valign(Gtk.Align.CENTER)
         self.shuffle_btn.set_size_request(48, 48)
         self.shuffle_btn.set_tooltip_text("Shuffle")
-        self.shuffle_btn.connect("clicked", self.on_shuffle_clicked)
+        self.shuffle_btn.connect("clicked", lambda btn: weak_self().on_shuffle_clicked(btn) if weak_self() else None)
         actions.append(self.shuffle_btn)
 
         self.radio_btn = Gtk.Button()
@@ -184,7 +196,7 @@ class ArtistPage(Adw.Bin):
         self.radio_btn.set_valign(Gtk.Align.CENTER)
         self.radio_btn.set_size_request(48, 48)
         self.radio_btn.set_tooltip_text("Start Radio")
-        self.radio_btn.connect("clicked", self.on_radio_clicked)
+        self.radio_btn.connect("clicked", lambda btn: weak_self().on_radio_clicked(btn) if weak_self() else None)
         actions.append(self.radio_btn)
 
         self.subscribe_btn = Gtk.Button()
@@ -194,7 +206,7 @@ class ArtistPage(Adw.Bin):
         self.subscribe_btn.set_valign(Gtk.Align.CENTER)
         self.subscribe_btn.set_size_request(48, 48)
         self.subscribe_btn.set_tooltip_text("Subscribe")
-        self.subscribe_btn.connect("clicked", self.on_subscribe_clicked)
+        self.subscribe_btn.connect("clicked", lambda btn: weak_self().on_subscribe_clicked(btn) if weak_self() else None)
         actions.append(self.subscribe_btn)
 
         # Description
@@ -214,7 +226,9 @@ class ArtistPage(Adw.Bin):
         self.read_more_btn.add_css_class("caption")
         self.read_more_btn.set_halign(Gtk.Align.START)
         self.read_more_btn.set_visible(False)
-        self.read_more_btn.connect("activate-link", self._on_read_more_link)
+        self.read_more_btn.connect(
+            "activate-link", lambda label, uri: weak_self()._on_read_more_link(label, uri) if weak_self() else None
+        )
         self._description_expanded = False
 
         self.description_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
@@ -264,13 +278,18 @@ class ArtistPage(Adw.Bin):
         thread.start()
 
     def _fetch_artist(self, channel_id):
+        if getattr(self, "_cleaned_up", False):
+            return
+        client = self.client
+        if not client:
+            return
         try:
-            self._artist_data = self.client.get_artist(channel_id)
+            self._artist_data = client.get_artist(channel_id)
 
             # Fetch missing sections (playlists, featured on, live) from raw API
             if self._artist_data and not self._artist_data.get("_is_channel"):
                 try:
-                    raw = self.client.api._send_request(
+                    raw = client.api._send_request(
                         "browse", {"browseId": channel_id}
                     )
                     tabs = (
@@ -318,7 +337,7 @@ class ArtistPage(Adw.Bin):
                                 ):
                                     items = []
                                     for raw_item in r.get("contents", []):
-                                        parsed = self.client._parse_channel_item(
+                                        parsed = client._parse_channel_item(
                                             raw_item
                                         )
                                         if parsed:
@@ -336,7 +355,7 @@ class ArtistPage(Adw.Bin):
                                 ):
                                     items = []
                                     for raw_item in r.get("contents", []):
-                                        parsed = self.client._parse_channel_item(
+                                        parsed = client._parse_channel_item(
                                             raw_item
                                         )
                                         if parsed:
@@ -356,8 +375,10 @@ class ArtistPage(Adw.Bin):
 
             def detail_fetch(key, browse_id, params):
                 try:
+                    if getattr(self, "_cleaned_up", False):
+                        return
                     # Limit to 10 for the initial view as requested
-                    detailed_items = self.client.get_artist_albums(
+                    detailed_items = client.get_artist_albums(
                         browse_id, params, limit=10
                     )
                     if detailed_items:
@@ -376,7 +397,7 @@ class ArtistPage(Adw.Bin):
                     if b_id:
                         # For songs, we use get_playlist to get the full list
                         fetch_target = (
-                            self.client.get_playlist if key == "songs" else detail_fetch
+                            client.get_playlist if key == "songs" else detail_fetch
                         )
                         target_args = (
                             (b_id,) if key == "songs" else (key, b_id, p_params)
@@ -402,12 +423,16 @@ class ArtistPage(Adw.Bin):
             for t in detail_threads:
                 t.join(timeout=10.0)  # Generous timeout for multiple deep fetches
 
+            if getattr(self, "_cleaned_up", False):
+                return
             self._is_ui_init = False  # Fresh load
             GLib.idle_add(self.update_ui, self._artist_data)
         except Exception as e:
             print(f"Error fetching artist: {e}")
 
     def update_ui(self, data):
+        if getattr(self, "_cleaned_up", False):
+            return
         if not data:
             return
 
@@ -445,16 +470,17 @@ class ArtistPage(Adw.Bin):
 
         subs = data.get("subscribers") or ""
         if subs:
-            subs += " subscribers"
+            subs = str(subs) + " subscribers"
 
         views = data.get("views")
         if views:
+            views = str(views)
             if subs:
                 subs += " • " + views
             else:
                 subs = views
 
-        self.subscribers_label.set_label(subs)
+        self.subscribers_label.set_label(str(subs))
 
         # Subscription Status
         self._is_subscribed = data.get("subscribed", False)
@@ -561,7 +587,8 @@ class ArtistPage(Adw.Bin):
         list_box = Gtk.ListBox()
         list_box.add_css_class("boxed-list")
         list_box.set_selection_mode(Gtk.SelectionMode.NONE)
-        list_box.connect("row-activated", self.on_song_activated)
+        weak_self = weakref.ref(self)
+        list_box.connect("row-activated", lambda lb, r: weak_self().on_song_activated(lb, r) if weak_self() else None)
 
         limit = self._section_limits.get(title, 5)
         showing_items = items[:limit]
@@ -677,6 +704,7 @@ class ArtistPage(Adw.Bin):
                 )
                 like_btn.set_valign(Gtk.Align.CENTER)
                 box.append(like_btn)
+                row._like_btn = like_btn
 
             row.item_data = item
             list_box.append(row)
@@ -684,14 +712,15 @@ class ArtistPage(Adw.Bin):
             # Context Menu
             gesture = Gtk.GestureClick()
             gesture.set_button(3)
-            gesture.connect("pressed", self.on_song_right_click, row)
+            gesture.connect(
+                "pressed", lambda g, n, x, y, : weak_self().on_song_right_click(g, n, x, y, g.get_widget()) if weak_self() and g.get_widget() is not None else None
+            )
             row.add_controller(gesture)
 
             # Long Press for touch
             lp = Gtk.GestureLongPress()
             lp.connect(
-                "pressed",
-                lambda g, x, y, r=row: self.on_song_right_click(g, 1, x, y, r),
+                "pressed", lambda g, x, y, : weak_self().on_song_right_click(g, 1, x, y, g.get_widget()) if weak_self() and g.get_widget() is not None else None
             )
             row.add_controller(lp)
 
@@ -717,7 +746,7 @@ class ArtistPage(Adw.Bin):
             load_more_btn.connect(
                 "clicked",
                 lambda btn, t=title, sd=section_dict, s=spinner, lmb=load_more_btn: (
-                    self.on_load_more_clicked(lmb, t, sd, s, lmb)
+                    weak_self().on_load_more_clicked(lmb, t, sd, s, lmb) if weak_self() else None
                 ),
             )
             section_box.append(btn_box)
@@ -764,6 +793,7 @@ class ArtistPage(Adw.Bin):
             self.subscribe_btn.remove_css_class("liked-button")
 
     def add_grid_section(self, title, section_dict):
+        weak_self = weakref.ref(self)
         items = section_dict.get("results", [])
         if not items:
             return
@@ -867,24 +897,34 @@ class ArtistPage(Adw.Bin):
 
             inner_box.append(item_box)
 
+            # Keep strong reference to prevent PyGObject from dropping the wrapper
+            if not hasattr(self, '_alive_grid_items'):
+                self._alive_grid_items = []
+            self._alive_grid_items.append(item_box)
+
             # Left Click Activation
             click_gesture = Gtk.GestureClick()
             click_gesture.set_button(1)
-            click_gesture.connect("pressed", self._on_grid_item_pressed, item_box)
-            click_gesture.connect("released", self._on_grid_item_clicked, item_box)
+            click_gesture.connect(
+                "pressed", lambda g, n, x, y, wib=weakref.ref(item_box): weak_self()._on_grid_item_pressed(g, n, x, y, wib()) if weak_self() and wib() else None
+            )
+            click_gesture.connect(
+                "released", lambda g, n, x, y, wib=weakref.ref(item_box): weak_self()._on_grid_item_clicked(g, n, x, y, wib()) if weak_self() and wib() else None
+            )
             item_box.add_controller(click_gesture)
 
             # Right Click Menu
             gesture = Gtk.GestureClick()
             gesture.set_button(3)
-            gesture.connect("released", self.on_grid_right_click, item_box)
+            gesture.connect(
+                "released", lambda g, n, x, y, wib=weakref.ref(item_box): weak_self().on_grid_right_click(g, n, x, y, wib()) if weak_self() and wib() else None
+            )
             item_box.add_controller(gesture)
 
             # Long Press for touch
             lp = Gtk.GestureLongPress()
             lp.connect(
-                "pressed",
-                lambda g, x, y, ib=item_box: self.on_grid_right_click(g, 1, x, y, ib),
+                "pressed", lambda g, x, y, wib=weakref.ref(item_box): weak_self().on_grid_right_click(g, 1, x, y, wib()) if weak_self() and wib() else None
             )
             item_box.add_controller(lp)
 
@@ -905,8 +945,8 @@ class ArtistPage(Adw.Bin):
             # Click handler for Load More using the button directly
             more_btn.connect(
                 "clicked",
-                lambda btn, t=title, sd=section_dict: self.on_load_more_clicked(
-                    btn, t, sd, None, btn
+                lambda btn, t=title, sd=section_dict: (
+                    weak_self().on_load_more_clicked(btn, t, sd, None, btn) if weak_self() else None
                 ),
             )
 
@@ -1041,7 +1081,9 @@ class ArtistPage(Adw.Bin):
 
         threading.Thread(target=thread_func, daemon=True).start()
 
-    def on_grid_right_click(self, gesture, n_press, x, y, item_box):
+    def on_grid_right_click(self, gesture, n_press, x, y, item_box=None):
+        if item_box is None:
+            item_box = gesture.get_widget()
         if not hasattr(item_box, "item_data"):
             return
         data = item_box.item_data
@@ -1272,6 +1314,7 @@ class ArtistPage(Adw.Bin):
                     },
                 )
 
+
     def _build_queue_tracks(self):
         queue_tracks = []
         # Use full results from _artist_data to ensure all songs are added to queue
@@ -1419,3 +1462,54 @@ class ArtistPage(Adw.Bin):
             self.emit("header-title-changed", self.artist_name)
         else:
             self.emit("header-title-changed", "")
+
+    def _on_page_destroy(self, widget):
+        self.cleanup()
+
+    def cleanup(self):
+        """Clean up resources to prevent memory leaks."""
+        self._cleaned_up = True
+
+        # Disconnect scroll handler
+        if getattr(self, "_scroll_handler_id", None) is not None:
+            if hasattr(self, "vadjust") and self.vadjust:
+                try:
+                    self.vadjust.disconnect(self._scroll_handler_id)
+                except Exception:
+                    pass
+            self._scroll_handler_id = None
+
+        # Disconnect banner fade handler from root window
+        if getattr(self, "_banner_fade_root_handler", None) and hasattr(self, "banner_wrapper"):
+            root = self.banner_wrapper.get_root()
+            if root:
+                try:
+                    root.disconnect(self._banner_fade_root_handler)
+                except Exception:
+                    pass
+            self._banner_fade_root_handler = None
+
+        # Recursively cleanup image widgets to cancel pending async loads
+        from ui.utils import cleanup_widget_images
+        cleanup_widget_images(self)
+
+        self.current_songs = []
+        self._artist_data = None
+        self._section_widgets = {}
+
+        if hasattr(self, "sections_box") and self.sections_box:
+            child = self.sections_box.get_first_child()
+            while child:
+                next_child = child.get_next_sibling()
+                try:
+                    self.sections_box.remove(child)
+                except Exception:
+                    pass
+                child = next_child
+
+        # Clear references to break reference cycles
+        self.player = None
+        self.client = None
+        self.main_box = None
+        self.vadjust = None
+        self.clamp = None

@@ -1,5 +1,6 @@
 import os
 import threading
+import weakref
 import time
 import urllib.request
 import collections
@@ -888,6 +889,18 @@ class AsyncImage(Gtk.Image):
             return
         submit_fetch(fn, *args)
 
+    def cancel_pending(self):
+        """Cancel any pending mapped fetch and clear references."""
+        self._pending_fetch = None
+        if getattr(self, "_map_handler_id", None):
+            try:
+                self.disconnect(self._map_handler_id)
+            except Exception:
+                pass
+            self._map_handler_id = None
+        self.set_from_paintable(None)
+        self.player = None
+
     def load_url(self, url, **kwargs):
         orig_url = url
         url = get_high_res_url(url, self.target_w)
@@ -1224,6 +1237,18 @@ class AsyncPicture(Gtk.Picture):
             return
         submit_fetch(fn, *args)
 
+    def cancel_pending(self):
+        """Cancel any pending mapped fetch and clear references."""
+        self._pending_fetch = None
+        if getattr(self, "_map_handler_id", None):
+            try:
+                self.disconnect(self._map_handler_id)
+            except Exception:
+                pass
+            self._map_handler_id = None
+        self.set_paintable(None)
+        self.player = None
+
     def load_url(self, url, **kwargs):
         orig_url = url
         url = get_high_res_url(url, self.target_size)
@@ -1402,6 +1427,18 @@ class AsyncPicture(Gtk.Picture):
                 self.player.update_track_thumbnail(video_id, url)
 
 
+def cleanup_widget_images(widget):
+    """Recursively cancel pending image fetches in a widget tree."""
+    if not widget:
+        return
+    if isinstance(widget, (AsyncImage, AsyncPicture)):
+        widget.cancel_pending()
+    child = widget.get_first_child() if hasattr(widget, 'get_first_child') else None
+    while child:
+        cleanup_widget_images(child)
+        child = child.get_next_sibling()
+
+
 class MarqueeLabel(Gtk.ScrolledWindow):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -1492,7 +1529,8 @@ class LikeButton(Gtk.Button):
         self.set_valign(Gtk.Align.CENTER)
 
         self.update_icon()
-        self.connect("clicked", self.on_clicked)
+        weak_self = weakref.ref(self)
+        self.connect("clicked", lambda btn: weak_self().on_clicked(btn) if weak_self() else None)
 
     def update_icon(self):
         if self.status == "LIKE":
