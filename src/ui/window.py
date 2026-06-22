@@ -253,6 +253,9 @@ class MainWindow(Adw.ApplicationWindow):
         ctrl.connect("key-pressed", self.on_window_key_pressed)
         self.add_controller(ctrl)
 
+        # Setup periodic garbage collection to free C-level objects (GdkTexture, GdkPixbuf, Widgets)
+        GLib.timeout_add(5000, self._run_periodic_gc)
+
         # Avatar menu button — replaces the hamburger. Opens a popover
         # with the user's profile, their channel link, the library
         # navigation shortcuts (upload/history/downloads), and the
@@ -1416,6 +1419,9 @@ class MainWindow(Adw.ApplicationWindow):
         # blank surface for the 350ms until the fresh fetch lands.
         page.load_cached()
         nav_page = Adw.NavigationPage(child=page, title="Listening History")
+        if not hasattr(self, '_alive_pages'):
+            self._alive_pages = set()
+        self._alive_pages.add(page)
         nav.push(nav_page)
         # Fresh fetch runs after the transition so it doesn't compete
         # for frame time with the slide animation.
@@ -1436,6 +1442,9 @@ class MainWindow(Adw.ApplicationWindow):
         if getattr(self, "_is_compact", False):
             page.set_compact_mode(True)
         nav_page = Adw.NavigationPage(child=page, title="Downloaded Songs")
+        if not hasattr(self, '_alive_pages'):
+            self._alive_pages = set()
+        self._alive_pages.add(page)
         nav.push(nav_page)
         page.stack.set_visible_child_name("loading")
 
@@ -2437,6 +2446,7 @@ class MainWindow(Adw.ApplicationWindow):
 
             # Connect to page changes to update Back Button
             nav_view.connect("notify::visible-page", self.update_back_button_visibility)
+            nav_view.connect("popped", self._on_nav_page_popped)
 
             return nav_view
 
@@ -2481,6 +2491,29 @@ class MainWindow(Adw.ApplicationWindow):
 
     def set_header_title(self, title):
         pass
+
+    def _on_nav_page_popped(self, nav_view, nav_page):
+        """Clean up a page after it's been popped from a NavigationView."""
+        child = nav_page.get_child()
+        if child:
+            if hasattr(self, '_alive_pages') and child in self._alive_pages:
+                self._alive_pages.remove(child)
+            if hasattr(child, 'cleanup'):
+                try:
+                    child.cleanup()
+                except Exception as e:
+                    print(f"Error during page cleanup: {e}")
+            try:
+                nav_page.set_child(None)
+            except Exception:
+                pass
+        import gc
+        gc.collect()
+
+    def _run_periodic_gc(self):
+        import gc
+        gc.collect()
+        return True
 
     def _get_page_content(self, tab_name):
         # Helper to traverse: NavView -> NavPage -> ToolbarView -> Content
@@ -2643,6 +2676,9 @@ class MainWindow(Adw.ApplicationWindow):
         nav_page = Adw.NavigationPage(child=playlist_page, title="Playlist")
 
         # Push to stack
+        if not hasattr(self, '_alive_pages'):
+            self._alive_pages = set()
+        self._alive_pages.add(playlist_page)
         active_nav.push(nav_page)
 
         # Load data
@@ -2703,6 +2739,9 @@ class MainWindow(Adw.ApplicationWindow):
             child=artist_page, title=initial_name if initial_name else "Artist"
         )
 
+        if not hasattr(self, '_alive_pages'):
+            self._alive_pages = set()
+        self._alive_pages.add(artist_page)
         active_nav.push(nav_page)
 
         artist_page.load_artist(channel_id, initial_name)
@@ -2732,6 +2771,9 @@ class MainWindow(Adw.ApplicationWindow):
 
         nav_page = Adw.NavigationPage(child=disco_page, title=title)
 
+        if not hasattr(self, '_alive_pages'):
+            self._alive_pages = set()
+        self._alive_pages.add(disco_page)
         active_nav.push(nav_page)
 
         disco_page.load_discography(channel_id, title, browse_id, params, initial_items)
@@ -2752,6 +2794,9 @@ class MainWindow(Adw.ApplicationWindow):
 
         nav_page = Adw.NavigationPage(child=mood_page, title=title)
 
+        if not hasattr(self, '_alive_pages'):
+            self._alive_pages = set()
+        self._alive_pages.add(mood_page)
         active_nav.push(nav_page)
 
         mood_page.load_mood(params, title)
@@ -2777,6 +2822,9 @@ class MainWindow(Adw.ApplicationWindow):
             display_title = "All Moods & Moments"
 
         nav_page = Adw.NavigationPage(child=all_moods_page, title=display_title)
+        if not hasattr(self, '_alive_pages'):
+            self._alive_pages = set()
+        self._alive_pages.add(all_moods_page)
         active_nav.push(nav_page)
 
     def open_category(self, params, title):
@@ -2793,6 +2841,9 @@ class MainWindow(Adw.ApplicationWindow):
         cat_page.connect("header-title-changed", self.on_playlist_header_title_changed)
 
         nav_page = Adw.NavigationPage(child=cat_page, title=title)
+        if not hasattr(self, '_alive_pages'):
+            self._alive_pages = set()
+        self._alive_pages.add(cat_page)
         active_nav.push(nav_page)
 
         cat_page.load_category(params, title)
@@ -2908,8 +2959,15 @@ class MainWindow(Adw.ApplicationWindow):
                 from api.client import MusicClient
 
                 client = MusicClient()
-                playlist_id = client.api.get_album(album_id).get("audioPlaylistId")
-                GObject.idle_add(self.open_playlist, playlist_id, {"title": album_name})
+                try:
+                    playlist_id = client.api.get_album(album_id).get("audioPlaylistId")
+                    if playlist_id:
+                        GObject.idle_add(self.open_playlist, playlist_id, {"title": album_name})
+                    else:
+                        GObject.idle_add(self.open_playlist, album_id, {"title": album_name})
+                except Exception as e:
+                    print(f"Failed to resolve audioPlaylistId for {album_id}: {e}")
+                    GObject.idle_add(self.open_playlist, album_id, {"title": album_name})
             else:
                 # It's an implied playlist ID or similar
                 GObject.idle_add(self.open_playlist, album_id, {"title": album_name})

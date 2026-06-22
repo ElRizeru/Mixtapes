@@ -1,4 +1,5 @@
 import threading
+import weakref
 
 from gi.repository import Gtk, Adw, GLib, Gio, Gdk, GObject, Pango
 
@@ -24,6 +25,8 @@ class HistoryPage(Adw.Bin):
     def __init__(self, player, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.player = player
+        weak_self = weakref.ref(self)
+        self.connect("destroy", lambda w: weak_self()._on_page_destroy(w) if weak_self() else None)
         self.client = MusicClient()
         self._tracks = []
         # Collected on each rebuild so set_compact_mode can swap the
@@ -95,7 +98,10 @@ class HistoryPage(Adw.Bin):
 
         # Title-in-headerbar behavior matches PlaylistPage so the
         # NavigationPage's title bar stays in sync when scrolling.
-        self.scrolled.get_vadjustment().connect("value-changed", self._on_scroll)
+        weak_self = weakref.ref(self)
+        self._scroll_handler_id = self.scrolled.get_vadjustment().connect(
+            "value-changed", lambda adj: weak_self()._on_scroll(adj) if weak_self() else None
+        )
 
     # ── Loading ────────────────────────────────────────────────────────────
 
@@ -133,11 +139,17 @@ class HistoryPage(Adw.Bin):
             return
 
         def _fetch():
+            if getattr(self, "_cleaned_up", False):
+                return
             tracks = self.client.get_history() or []
+            if getattr(self, "_cleaned_up", False):
+                return
             self._normalize_durations(tracks)
             GLib.idle_add(self._render, tracks)
 
         def _kick():
+            if getattr(self, "_cleaned_up", False):
+                return False
             threading.Thread(target=_fetch, daemon=True).start()
             return False
 
@@ -188,6 +200,8 @@ class HistoryPage(Adw.Bin):
                     t["artist"] = ", ".join(real_artists)
 
     def _render(self, tracks):
+        if getattr(self, "_cleaned_up", False):
+            return
         self._loading_wrap.set_visible(False)
         self._tracks = tracks
         self._row_imgs = []
@@ -246,7 +260,10 @@ class HistoryPage(Adw.Bin):
             row = self._make_row(t)
             if row is not None:
                 listbox.append(row)
-        listbox.connect("row-activated", self._on_row_activated)
+        weak_self = weakref.ref(self)
+        listbox.connect(
+            "row-activated", lambda lb, r: weak_self()._on_row_activated(lb, r) if weak_self() else None
+        )
         box.append(listbox)
         return box
 
@@ -352,18 +369,21 @@ class HistoryPage(Adw.Bin):
         like.set_valign(Gtk.Align.CENTER)
         like.set_data(vid, track.get("likeStatus", "INDIFFERENT"))
         hb.append(like)
+        row._like_btn = like
 
         row.set_child(hb)
 
         # Right-click / long-press context menu
         click = Gtk.GestureClick()
         click.set_button(3)
-        click.connect("released", self._on_row_right_click, row)
+        weak_self = weakref.ref(self)
+        click.connect(
+            "released", lambda g, n, x, y, : weak_self()._on_row_right_click(g, n, x, y, g.get_widget()) if weak_self() and g.get_widget() is not None else None
+        )
         row.add_controller(click)
         lp = Gtk.GestureLongPress()
         lp.connect(
-            "pressed",
-            lambda g, x, y, r=row: self._on_row_right_click(g, 1, x, y, r),
+            "pressed", lambda g, x, y, : weak_self()._on_row_right_click(g, 1, x, y, g.get_widget()) if weak_self() and g.get_widget() is not None else None
         )
         row.add_controller(lp)
 
@@ -372,6 +392,7 @@ class HistoryPage(Adw.Bin):
     # ── Interactions ───────────────────────────────────────────────────────
 
     def _on_row_activated(self, listbox, row):
+        print(f"ROW ACTIVATED: {row}")
         track = getattr(row, "_track", None)
         if not track or not self._tracks:
             return
@@ -397,10 +418,13 @@ class HistoryPage(Adw.Bin):
         group = Gio.SimpleActionGroup()
         row.insert_action_group("row", group)
         menu = Gio.Menu()
+        weak_self = weakref.ref(self)
 
         # Play
         def _do_play(a, p):
-            self._on_row_activated(None, row)
+            s = weak_self()
+            if s:
+                s._on_row_activated(None, row)
         act = Gio.SimpleAction.new("play", None)
         act.connect("activate", _do_play)
         group.add_action(act)
@@ -408,7 +432,9 @@ class HistoryPage(Adw.Bin):
 
         # Add to queue (append without taking over playback)
         def _do_queue(a, p):
-            self.player.add_to_queue(track)
+            s = weak_self()
+            if s:
+                s.player.add_to_queue(track)
         act = Gio.SimpleAction.new("queue", None)
         act.connect("activate", _do_queue)
         group.add_action(act)
@@ -421,9 +447,11 @@ class HistoryPage(Adw.Bin):
             aname = artists[0].get("name", "")
 
             def _do_artist(a, p):
-                root = self.get_root()
-                if root and hasattr(root, "open_artist"):
-                    root.open_artist(aid, aname)
+                s = weak_self()
+                if s:
+                    root = s.get_root()
+                    if root and hasattr(root, "open_artist"):
+                        root.open_artist(aid, aname)
             act = Gio.SimpleAction.new("artist", None)
             act.connect("activate", _do_artist)
             group.add_action(act)
@@ -435,9 +463,11 @@ class HistoryPage(Adw.Bin):
             alb_id = album["id"]
 
             def _do_album(a, p):
-                root = self.get_root()
-                if root and hasattr(root, "open_playlist"):
-                    root.open_playlist(alb_id)
+                s = weak_self()
+                if s:
+                    root = s.get_root()
+                    if root and hasattr(root, "open_playlist"):
+                        root.open_playlist(alb_id)
             act = Gio.SimpleAction.new("album", None)
             act.connect("activate", _do_album)
             group.add_action(act)
@@ -447,9 +477,11 @@ class HistoryPage(Adw.Bin):
         def _do_copy(a, p):
             url = f"https://music.youtube.com/watch?v={vid}"
             Gdk.Display.get_default().get_clipboard().set(url)
-            root = self.get_root()
-            if root and hasattr(root, "add_toast"):
-                root.add_toast("Link copied")
+            s = weak_self()
+            if s:
+                root = s.get_root()
+                if root and hasattr(root, "add_toast"):
+                    root.add_toast("Link copied")
         act = Gio.SimpleAction.new("copy_link", None)
         act.connect("activate", _do_copy)
         group.add_action(act)
@@ -471,7 +503,9 @@ class HistoryPage(Adw.Bin):
             )
 
             def _do_remove(a, p):
-                self._remove_track_optimistic(vid, tokens)
+                s = weak_self()
+                if s:
+                    s._remove_track_optimistic(vid, tokens)
             act = Gio.SimpleAction.new("remove_history", None)
             act.connect("activate", _do_remove)
             group.add_action(act)
@@ -535,9 +569,11 @@ class HistoryPage(Adw.Bin):
             self.empty_label.set_visible(True)
 
         # 4. Fire the API call.
+        client = self.client
         def _th():
             try:
-                self.client.remove_history_items(tokens)
+                if client:
+                    client.remove_history_items(tokens)
             except Exception as e:
                 print(f"[HISTORY] remove failed: {e}")
 
@@ -564,3 +600,53 @@ class HistoryPage(Adw.Bin):
             self.remove_css_class("compact")
             self.content_box.set_margin_start(24)
             self.content_box.set_margin_end(24)
+
+    def _on_page_destroy(self, widget):
+        self.cleanup()
+
+    def cleanup(self):
+        """Clean up resources to prevent memory leaks."""
+        self._cleaned_up = True
+
+        # Disconnect scroll handler
+        if getattr(self, "_scroll_handler_id", None) is not None:
+            if hasattr(self, "scrolled") and self.scrolled:
+                try:
+                    self.scrolled.get_vadjustment().disconnect(self._scroll_handler_id)
+                except Exception:
+                    pass
+            self._scroll_handler_id = None
+
+        from ui.utils import cleanup_widget_images
+        cleanup_widget_images(self)
+
+        self._tracks = []
+        self._row_imgs = []
+
+        if hasattr(self, "sections_box") and self.sections_box:
+            child = self.sections_box.get_first_child()
+            while child:
+                next_child = child.get_next_sibling()
+                try:
+                    self.sections_box.remove(child)
+                except Exception:
+                    pass
+                child = next_child
+
+        if hasattr(self, "scrolled") and self.scrolled:
+            try:
+                self.scrolled.set_child(None)
+            except Exception:
+                pass
+
+        # Clear references to break GObject reference cycles
+        self.player = None
+        self.client = None
+        self.main_box = None
+        self.scrolled = None
+        self.clamp = None
+        self.content_box = None
+        self.title_label = None
+        self.sections_box = None
+        self.empty_label = None
+        self._loading_wrap = None

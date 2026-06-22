@@ -1,4 +1,5 @@
 import json
+import weakref
 from gi.repository import Gtk, Adw, GObject, GLib, Pango, Gio, Gdk
 import threading
 from api.client import MusicClient
@@ -13,6 +14,8 @@ class CategoryPage(Adw.Bin):
     def __init__(self, player, open_playlist_callback, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.player = player
+        weak_self = weakref.ref(self)
+        self.connect("destroy", lambda w: weak_self()._on_page_destroy(w) if weak_self() else None)
         self.open_playlist_callback = open_playlist_callback
         self.client = MusicClient()
         self.params = None
@@ -106,6 +109,8 @@ class CategoryPage(Adw.Bin):
         self._load_data()
 
     def _load_data(self):
+        if getattr(self, "_cleaned_up", False):
+            return
         if self._is_loading:
             return
 
@@ -116,20 +121,29 @@ class CategoryPage(Adw.Bin):
             GLib.idle_add(self._render_sections, self._cached_sections)
             return
 
+        client = self.client
+        p = self.params
         def fetch_func():
+            if getattr(self, "_cleaned_up", False):
+                return
             try:
-                sections = self.client.get_category_page(self.params)
+                sections = client.get_category_page(p)
+                if getattr(self, "_cleaned_up", False):
+                    return
                 self._cached_sections = sections
-                self._cached_params = self.params
+                self._cached_params = p
                 GLib.idle_add(self._render_sections, sections)
             except Exception as e:
                 print(f"Error loading category page: {e}")
-                GLib.idle_add(lambda: self._loading_wrap.set_visible(False))
-                self._is_loading = False
+                if not getattr(self, "_cleaned_up", False):
+                    GLib.idle_add(lambda: self._loading_wrap.set_visible(False))
+                    self._is_loading = False
 
         threading.Thread(target=fetch_func, daemon=True).start()
 
     def _render_sections(self, sections):
+        if getattr(self, "_cleaned_up", False):
+            return
         # Clear existing items again just in case
         child = self.content_box.get_first_child()
         while child:
@@ -240,17 +254,24 @@ class CategoryPage(Adw.Bin):
 
             click_gesture = Gtk.GestureClick()
             click_gesture.set_button(1)
-            click_gesture.connect("released", self._on_item_clicked, item)
+            weak_self = weakref.ref(self)
+            click_gesture.connect(
+                "released", lambda g, n, x, y, it=item: weak_self()._on_item_clicked(g, n, x, y, it) if weak_self() else None
+            )
             item_box.add_controller(click_gesture)
 
             # Right Click context menu
             right_click = Gtk.GestureClick()
             right_click.set_button(3)
-            right_click.connect("released", self.on_grid_right_click, item_box)
+            right_click.connect(
+                "released", lambda g, n, x, y, : weak_self().on_grid_right_click(g, n, x, y, g.get_widget()) if weak_self() and g.get_widget() is not None else None
+            )
             item_box.add_controller(right_click)
 
             lp = Gtk.GestureLongPress()
-            lp.connect("pressed", lambda g, x, y, ib=item_box: self.on_grid_right_click(g, 1, x, y, ib))
+            lp.connect(
+                "pressed", lambda g, x, y, : weak_self().on_grid_right_click(g, 1, x, y, g.get_widget()) if weak_self() and g.get_widget() is not None else None
+            )
             item_box.add_controller(lp)
 
         scroll_box.set_content(inner_box)
@@ -352,6 +373,7 @@ class CategoryPage(Adw.Bin):
                 )
                 like_btn.set_valign(Gtk.Align.CENTER)
                 box.append(like_btn)
+                row._like_btn = like_btn
 
             row.item_data = item
             list_box.append(row)
@@ -359,13 +381,18 @@ class CategoryPage(Adw.Bin):
             # Left Click Activation
             click_gesture = Gtk.GestureClick()
             click_gesture.set_button(1)
-            click_gesture.connect("released", self._on_item_clicked, item)
+            weak_self = weakref.ref(self)
+            click_gesture.connect(
+                "released", lambda g, n, x, y, it=item: weak_self()._on_item_clicked(g, n, x, y, it) if weak_self() else None
+            )
             row.add_controller(click_gesture)
 
             # Right Click context menu
             right_click = Gtk.GestureClick()
             right_click.set_button(3)
-            right_click.connect("released", self.on_song_right_click, row)
+            right_click.connect(
+                "released", lambda g, n, x, y, : weak_self().on_song_right_click(g, n, x, y, g.get_widget()) if weak_self() and g.get_widget() is not None else None
+            )
             row.add_controller(right_click)
 
         section_box.append(list_box)
@@ -380,7 +407,9 @@ class CategoryPage(Adw.Bin):
             btn_box.set_halign(Gtk.Align.CENTER)
             btn_box.append(show_all_btn)
 
-            show_all_btn.connect("clicked", lambda btn, t=title: self.on_show_all_songs_clicked(t))
+            show_all_btn.connect(
+                "clicked", lambda btn, t=title: weak_self().on_show_all_songs_clicked(t) if weak_self() else None
+            )
             section_box.append(btn_box)
 
     def on_show_all_songs_clicked(self, title):
@@ -553,3 +582,39 @@ class CategoryPage(Adw.Bin):
             self.player.play_tracks([item])
         elif browse_id:
             self.open_playlist_callback(browse_id)
+
+    def _on_page_destroy(self, widget):
+        self.cleanup()
+
+    def cleanup(self):
+        """Clean up resources to prevent memory leaks."""
+        self._cleaned_up = True
+        from ui.utils import cleanup_widget_images
+        cleanup_widget_images(self)
+
+        self._cached_sections = None
+        self._cached_params = None
+
+        if hasattr(self, "content_box") and self.content_box:
+            child = self.content_box.get_first_child()
+            while child:
+                next_child = child.get_next_sibling()
+                try:
+                    self.content_box.remove(child)
+                except Exception:
+                    pass
+                child = next_child
+
+        if hasattr(self, "scrolled") and self.scrolled:
+            try:
+                self.scrolled.set_child(None)
+            except Exception:
+                pass
+
+        # Clear references to break reference cycles
+        self.player = None
+        self.client = None
+        self.main_box = None
+        self.scrolled = None
+        self.content_box = None
+        self.clamp = None
