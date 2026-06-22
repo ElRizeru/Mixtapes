@@ -1,5 +1,6 @@
 from gi.repository import Gtk, Adw, GObject, GLib, Pango, Gdk, Gio
 import threading
+import weakref
 import re
 from api.client import MusicClient
 from ui.utils import AsyncImage, LikeButton, get_yt_music_link, show_toast
@@ -16,8 +17,9 @@ class BasePlaylistPage(Adw.Bin):
     def __init__(self, player, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.player = player
-        self.connect("map", self._on_map)
-        self.connect("unmap", self._on_unmap)
+        weak_self = weakref.ref(self)
+        self.connect("map", lambda w: weak_self()._on_map(w) if weak_self() else None)
+        self.connect("unmap", lambda w: weak_self()._on_unmap(w) if weak_self() else None)
         self.client = MusicClient()
         self.playlist_id = None
         self.playlist_title_text = ""
@@ -33,7 +35,9 @@ class BasePlaylistPage(Adw.Bin):
         # Monitor scroll for title
         vadjust = scrolled.get_vadjustment()
         self.vadjust = vadjust
-        vadjust.connect("value-changed", self._on_scroll)
+        self._scroll_handler_id = vadjust.connect(
+            "value-changed", lambda adj: weak_self()._on_scroll(adj) if weak_self() else None
+        )
 
         # Clamp for content
         clamp = Adw.Clamp()
@@ -101,7 +105,9 @@ class BasePlaylistPage(Adw.Bin):
         self.read_more_btn.add_css_class("caption")
         self.read_more_btn.set_halign(Gtk.Align.START)
         self.read_more_btn.set_visible(False)
-        self.read_more_btn.connect("activate-link", self._on_read_more_clicked)
+        self.read_more_btn.connect(
+            "activate-link", lambda label, uri: weak_self()._on_read_more_clicked(label, uri) if weak_self() else None
+        )
 
         self.desc_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.desc_box.append(self.description_label)
@@ -114,7 +120,9 @@ class BasePlaylistPage(Adw.Bin):
         self.meta_label.set_wrap(True)
         self.meta_label.set_halign(Gtk.Align.START)
         self.meta_label.set_use_markup(True)
-        self.meta_label.connect("activate-link", self.on_meta_link_activated)
+        self.meta_label.connect(
+            "activate-link", lambda label, uri: weak_self().on_meta_link_activated(label, uri) if weak_self() else None
+        )
         self.details_col.append(self.meta_label)
 
         self.stats_label = Gtk.Label(label="")
@@ -127,17 +135,14 @@ class BasePlaylistPage(Adw.Bin):
         actions_box.set_margin_top(12)
         self.actions_box = actions_box
 
-        play_btn = Gtk.Button(label="Play")
-        play_btn.add_css_class("suggested-action")
-        play_btn.add_css_class("pill")
-        play_btn.connect("clicked", self.on_play_clicked)
+        play_btn.connect("clicked", lambda btn: weak_self().on_play_clicked(btn) if weak_self() else None)
         actions_box.append(play_btn)
 
         shuffle_btn = Gtk.Button()
         shuffle_btn.set_icon_name("media-playlist-shuffle-symbolic")
         shuffle_btn.add_css_class("circular")
         shuffle_btn.set_size_request(48, 48)
-        shuffle_btn.connect("clicked", self.on_shuffle_clicked)
+        shuffle_btn.connect("clicked", lambda btn: weak_self().on_shuffle_clicked(btn) if weak_self() else None)
         actions_box.append(shuffle_btn)
 
         # Simplified Actions (Play/Shuffle only)
@@ -161,15 +166,21 @@ class BasePlaylistPage(Adw.Bin):
         action_add = Gio.SimpleAction.new(
             "add_all_to_playlist", GLib.VariantType.new("s")
         )
-        action_add.connect("activate", self._on_add_all_to_playlist)
+        action_add.connect(
+            "activate", lambda a, p: weak_self()._on_add_all_to_playlist(a, p) if weak_self() else None
+        )
         self.action_group.add_action(action_add)
 
         action_show_add = Gio.SimpleAction.new("show_add_all_to_playlist", None)
-        action_show_add.connect("activate", self._on_show_add_all_to_playlist)
+        action_show_add.connect(
+            "activate", lambda a, p: weak_self()._on_show_add_all_to_playlist(a, p) if weak_self() else None
+        )
         self.action_group.add_action(action_show_add)
 
         action_copy = Gio.SimpleAction.new("copy_link", None)
-        action_copy.connect("activate", self.on_copy_link_clicked)
+        action_copy.connect(
+            "activate", lambda a, p: weak_self().on_copy_link_clicked(a, p) if weak_self() else None
+        )
         self.action_group.add_action(action_copy)
 
         self.sort_dropdown = Gtk.DropDown.new_from_strings(
@@ -185,7 +196,9 @@ class BasePlaylistPage(Adw.Bin):
         self.sort_dropdown.set_valign(Gtk.Align.CENTER)
         self.sort_dropdown.add_css_class("pill")
         self.sort_dropdown.add_css_class("sort-dropdown")
-        self.sort_dropdown.connect("notify::selected", self.on_sort_changed)
+        self.sort_dropdown.connect(
+            "notify::selected", lambda dd, spec: weak_self().on_sort_changed(dd, spec) if weak_self() else None
+        )
 
         self.details_col.append(actions_box)
         content_box.append(header_clamp)
@@ -212,16 +225,24 @@ class BasePlaylistPage(Adw.Bin):
         self.selection_model.set_autoselect(False)
 
         factory = Gtk.SignalListItemFactory()
-        factory.connect("setup", self._on_factory_setup)
-        factory.connect("bind", self._on_factory_bind)
-        factory.connect("unbind", self._on_factory_unbind)
+        factory.connect(
+            "setup", lambda f, li: weak_self()._on_factory_setup(f, li) if weak_self() else None
+        )
+        factory.connect(
+            "bind", lambda f, li: weak_self()._on_factory_bind(f, li) if weak_self() else None
+        )
+        factory.connect(
+            "unbind", lambda f, li: weak_self()._on_factory_unbind(f, li) if weak_self() else None
+        )
 
         self.songs_view = Gtk.ListView(model=self.selection_model, factory=factory)
         self.songs_view.add_css_class("boxed-list")
         # Keyboard activation: Enter/Space on the focused row plays it. The
         # ListView's "activate" signal passes an int position, which
         # on_song_activated already handles (alongside the click-gesture path).
-        self.songs_view.connect("activate", self.on_song_activated)
+        self.songs_view.connect(
+            "activate", lambda lv, pos: weak_self().on_song_activated(lv, pos) if weak_self() else None
+        )
         self.songs_view.set_visible(False)
         track_section.append(self.songs_view)
 
@@ -276,11 +297,27 @@ class BasePlaylistPage(Adw.Bin):
         # widget tree, track lists, etc.) leaks every time the user opens a
         # playlist. After heavy navigation that pinned hundreds of MB.
         self._player_metadata_handler = self.player.connect(
-            "metadata-changed", self._update_playing_indicator
+            "metadata-changed", lambda player, *args: weak_self()._update_playing_indicator(player, *args) if weak_self() else None
         )
-        self.connect("destroy", self._on_page_destroy)
+        self.connect("destroy", lambda w: weak_self()._on_page_destroy(w) if weak_self() else None)
 
     def _on_page_destroy(self, widget):
+        self.cleanup()
+
+    def cleanup(self):
+        """Perform resource cleanup when the page is popped/destroyed."""
+        self._cleaned_up = True
+
+        # Disconnect scroll handler
+        if getattr(self, "_scroll_handler_id", None) is not None:
+            if hasattr(self, "vadjust") and self.vadjust:
+                try:
+                    self.vadjust.disconnect(self._scroll_handler_id)
+                except Exception:
+                    pass
+            self._scroll_handler_id = None
+
+        # Disconnect player signals
         hid = getattr(self, "_player_metadata_handler", None)
         if hid is not None:
             try:
@@ -288,6 +325,25 @@ class BasePlaylistPage(Adw.Bin):
             except Exception:
                 pass
             self._player_metadata_handler = None
+
+        # Clear store and tracks to break references
+        if hasattr(self, "store") and self.store:
+            try:
+                self.store.remove_all()
+            except Exception:
+                pass
+        self.current_tracks = []
+        self.original_tracks = []
+
+        # Recursively cleanup image widgets to cancel pending async loads
+        from ui.utils import cleanup_widget_images
+        cleanup_widget_images(self)
+
+        # Clear references to break GObject reference cycles
+        self.player = None
+        self.client = None
+        self.main_box = None
+        self.vadjust = None
 
     def _on_factory_setup(self, factory, list_item):
         widget = SongRowWidget(self.player, self.client)
@@ -433,6 +489,8 @@ class BasePlaylistPage(Adw.Bin):
         append=False,
         total_tracks=None,
     ):
+        if getattr(self, "_cleaned_up", False):
+            return
         self.stack.set_visible_child_name("content")
         self.content_spinner.set_visible(False)
         self.playlist_title_text = title

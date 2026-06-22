@@ -1,3 +1,4 @@
+import weakref
 from gi.repository import Gtk, Adw, GObject, GLib, Pango, Gio, Gdk
 import threading
 from api.client import MusicClient
@@ -893,6 +894,7 @@ class SearchPage(Adw.Bin):
                 )
                 like_btn.set_valign(Gtk.Align.CENTER)
                 box.append(like_btn)
+                row._like_btn = like_btn
 
             row.item_data = item
             row.set_activatable(True)
@@ -906,7 +908,7 @@ class SearchPage(Adw.Bin):
             # Long Press for touch
             lp = Gtk.GestureLongPress()
             lp.connect(
-                "pressed", lambda g, x, y, r=row: self.on_row_right_click(g, 1, x, y, r)
+                "pressed", lambda g, x, y, : self.on_row_right_click(g, 1, x, y, g.get_widget())
             )
             row.add_controller(lp)
 
@@ -1210,7 +1212,7 @@ class SearchPage(Adw.Bin):
             elif "browseId" in data:
                 # Check if it's a playlist or artist
                 if res_type in ["playlist", "album"] or data["browseId"].startswith(
-                    ("VL", "PL", "RD", "OL", "MPRE")
+                    ("VL", "PL", "RD", "OL", "MPRE", "FEmusic_release_")
                 ):
                     open_pid(data["browseId"])
                 else:

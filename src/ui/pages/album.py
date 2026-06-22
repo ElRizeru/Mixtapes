@@ -39,8 +39,16 @@ class AlbumPage(BasePlaylistPage):
         thread.start()
 
     def _fetch_details(self):
+        if getattr(self, "_cleaned_up", False):
+            return
+        client = self.client
+        pid = self.playlist_id
+        if not client or not pid:
+            return
         try:
-            data = self.client.get_album(self.playlist_id)
+            data = client.get_album(pid)
+            if getattr(self, "_cleaned_up", False):
+                return
             title = data.get("title", "Unknown Album")
             description = data.get("description", "")
             tracks = data.get("tracks", [])
@@ -88,6 +96,8 @@ class AlbumPage(BasePlaylistPage):
                     if not t.get("thumbnails"):
                         t["thumbnails"] = thumbnails
 
+            if getattr(self, "_cleaned_up", False):
+                return
             GObject.idle_add(
                 self.update_ui, title, description, meta1, meta2, thumbnails, tracks
             )
@@ -111,3 +121,6 @@ class AlbumPage(BasePlaylistPage):
             title, description, meta1, meta2, thumbnails, tracks, append, total_tracks
         )
         # self.sort_row.set_visible(False)
+
+    def cleanup(self):
+        super().cleanup()

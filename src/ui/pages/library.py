@@ -1,3 +1,4 @@
+import weakref
 import os
 import json as _json
 from gi.repository import Gtk, Adw, GObject, GLib, Gdk, Gio, Pango
@@ -1067,7 +1068,7 @@ class LibraryPage(Adw.Bin):
                 lp = Gtk.GestureLongPress()
                 lp.connect(
                     "pressed",
-                    lambda g, x, y, r=row: self.on_row_right_click(g, 1, x, y, r),
+                    lambda g, x, y, : self.on_row_right_click(g, 1, x, y, g.get_widget()),
                 )
                 row.add_controller(lp)
 
@@ -1185,7 +1186,7 @@ class LibraryPage(Adw.Bin):
                 lp = Gtk.GestureLongPress()
                 lp.connect(
                     "pressed",
-                    lambda g, x, y, r=row: self.on_album_right_click(g, 1, x, y, r),
+                    lambda g, x, y, : self.on_album_right_click(g, 1, x, y, g.get_widget()),
                 )
                 row.add_controller(lp)
 
@@ -2130,7 +2131,7 @@ class UploadsPage(Gtk.Box):
             row.add_controller(gesture)
 
             lp = Gtk.GestureLongPress()
-            lp.connect("pressed", lambda g, x, y, r=row: self._on_album_right_click(g, 1, x, y, r))
+            lp.connect("pressed", lambda g, x, y, : self._on_album_right_click(g, 1, x, y, g.get_widget()))
             row.add_controller(lp)
 
             self.albums_list.append(row)

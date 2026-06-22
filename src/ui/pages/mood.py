@@ -1,5 +1,6 @@
 from gi.repository import Gtk, Adw, GObject, GLib, Gio, Pango, Gdk
 import threading
+import weakref
 from api.client import MusicClient
 from ui.utils import AsyncImage
 from ui.util_classes import ScrolledWindow
@@ -13,6 +14,8 @@ class MoodPage(Adw.Bin):
     def __init__(self, player, open_playlist_callback, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.player = player
+        weak_self = weakref.ref(self)
+        self.connect("destroy", lambda w: weak_self()._on_page_destroy(w) if weak_self() else None)
         self.open_playlist_callback = open_playlist_callback
         self.client = MusicClient()
         self.params = None
@@ -45,7 +48,10 @@ class MoodPage(Adw.Bin):
         self.flow_box.set_row_spacing(0)
         self.flow_box.set_homogeneous(True)
         self.flow_box.set_activate_on_single_click(True)
-        self.flow_box.connect("child-activated", self.on_grid_child_activated)
+        weak_self = weakref.ref(self)
+        self.flow_box.connect(
+            "child-activated", lambda fb, child: weak_self().on_grid_child_activated(fb, child) if weak_self() else None
+        )
 
         self.content_box.append(self.flow_box)
 
@@ -100,17 +106,25 @@ class MoodPage(Adw.Bin):
 
 
     def _load_data(self):
+        if getattr(self, "_cleaned_up", False):
+            return
         if self._is_loading:
             return
 
         self._is_loading = True
         self._loading_wrap.set_visible(True)
 
+        client = self.client
+        p = self.params
         def fetch_func():
+            if getattr(self, "_cleaned_up", False):
+                return
             try:
-                new_items = self.client.get_mood_playlists(self.params)
+                new_items = client.get_mood_playlists(p)
 
                 def update_cb():
+                    if getattr(self, "_cleaned_up", False):
+                        return
                     if new_items:
                         self.items.extend(new_items)
                         self._render_items(new_items)
@@ -118,11 +132,14 @@ class MoodPage(Adw.Bin):
                     self._is_loading = False
                     self._loading_wrap.set_visible(False)
 
+                if getattr(self, "_cleaned_up", False):
+                    return
                 GLib.idle_add(update_cb)
             except Exception as e:
                 print(f"Error loading mood playlists: {e}")
-                GLib.idle_add(lambda: self._loading_wrap.set_visible(False))
-                self._is_loading = False
+                if not getattr(self, "_cleaned_up", False):
+                    GLib.idle_add(lambda: self._loading_wrap.set_visible(False))
+                    self._is_loading = False
 
         threading.Thread(target=fetch_func, daemon=True).start()
 
@@ -163,14 +180,16 @@ class MoodPage(Adw.Bin):
 
             gesture = Gtk.GestureClick()
             gesture.set_button(3)
-            gesture.connect("pressed", self.on_grid_right_click, item_box)
+            weak_self = weakref.ref(self)
+            gesture.connect(
+                "pressed", lambda g, n, x, y, : weak_self().on_grid_right_click(g, n, x, y, g.get_widget()) if weak_self() and g.get_widget() is not None else None
+            )
             item_box.add_controller(gesture)
 
             # Long Press for touch
             lp = Gtk.GestureLongPress()
             lp.connect(
-                "pressed",
-                lambda g, x, y, ib=item_box: self.on_grid_right_click(g, 1, x, y, ib),
+                "pressed", lambda g, x, y, : weak_self().on_grid_right_click(g, 1, x, y, g.get_widget()) if weak_self() and g.get_widget() is not None else None
             )
             item_box.add_controller(lp)
 
@@ -193,13 +212,18 @@ class MoodPage(Adw.Bin):
         item_box.insert_action_group("item", group)
 
         # Play Action
+        weak_self = weakref.ref(self)
         play_action = Gio.SimpleAction.new("play", None)
-        play_action.connect("activate", self._on_play_item, data)
+        play_action.connect(
+            "activate", lambda a, p, d=data: weak_self()._on_play_item(a, p, d) if weak_self() else None
+        )
         group.add_action(play_action)
 
         # Queue Action
         queue_action = Gio.SimpleAction.new("queue", None)
-        queue_action.connect("activate", self._on_queue_item, data)
+        queue_action.connect(
+            "activate", lambda a, p, d=data: weak_self()._on_queue_item(a, p, d) if weak_self() else None
+        )
         group.add_action(queue_action)
 
         menu = Gio.Menu()
@@ -252,3 +276,38 @@ class MoodPage(Adw.Bin):
                 GLib.idle_add(window.player.extend_queue, tracks)
 
         threading.Thread(target=thread_func, daemon=True).start()
+
+    def _on_page_destroy(self, widget):
+        self.cleanup()
+
+    def cleanup(self):
+        """Clean up resources to prevent memory leaks."""
+        self._cleaned_up = True
+        from ui.utils import cleanup_widget_images
+        cleanup_widget_images(self)
+
+        self.items = []
+
+        if hasattr(self, "flow_box") and self.flow_box:
+            child = self.flow_box.get_first_child()
+            while child:
+                next_child = child.get_next_sibling()
+                try:
+                    self.flow_box.remove(child)
+                except Exception:
+                    pass
+                child = next_child
+
+        if hasattr(self, "scrolled") and self.scrolled:
+            try:
+                self.scrolled.set_child(None)
+            except Exception:
+                pass
+
+        # Clear references to break reference cycles
+        self.player = None
+        self.client = None
+        self.main_box = None
+        self.scrolled = None
+        self.flow_box = None
+        self.content_box = None
