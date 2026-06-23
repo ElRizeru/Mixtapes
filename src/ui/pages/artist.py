@@ -895,10 +895,10 @@ class ArtistPage(Adw.Bin):
             click_gesture = Gtk.GestureClick()
             click_gesture.set_button(1)
             click_gesture.connect(
-                "pressed", lambda g, n, x, y, wib=weakref.ref(item_box): weak_self()._on_grid_item_pressed(g, n, x, y, wib()) if weak_self() and wib() else None
+                "pressed", lambda g, n, x, y: weak_self()._on_grid_item_pressed(g, n, x, y, g.get_widget()) if weak_self() and g.get_widget() is not None else None
             )
             click_gesture.connect(
-                "released", lambda g, n, x, y, wib=weakref.ref(item_box): weak_self()._on_grid_item_clicked(g, n, x, y, wib()) if weak_self() and wib() else None
+                "released", lambda g, n, x, y: weak_self()._on_grid_item_clicked(g, n, x, y, g.get_widget()) if weak_self() and g.get_widget() is not None else None
             )
             item_box.add_controller(click_gesture)
 
@@ -906,14 +906,14 @@ class ArtistPage(Adw.Bin):
             gesture = Gtk.GestureClick()
             gesture.set_button(3)
             gesture.connect(
-                "released", lambda g, n, x, y, wib=weakref.ref(item_box): weak_self().on_grid_right_click(g, n, x, y, wib()) if weak_self() and wib() else None
+                "released", lambda g, n, x, y: weak_self().on_grid_right_click(g, n, x, y, g.get_widget()) if weak_self() and g.get_widget() is not None else None
             )
             item_box.add_controller(gesture)
 
             # Long Press for touch
             lp = Gtk.GestureLongPress()
             lp.connect(
-                "pressed", lambda g, x, y, wib=weakref.ref(item_box): weak_self().on_grid_right_click(g, 1, x, y, wib()) if weak_self() and wib() else None
+                "pressed", lambda g, x, y: weak_self().on_grid_right_click(g, 1, x, y, g.get_widget()) if weak_self() and g.get_widget() is not None else None
             )
             item_box.add_controller(lp)
 

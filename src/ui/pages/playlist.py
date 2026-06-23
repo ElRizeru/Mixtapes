@@ -2906,14 +2906,16 @@ class PlaylistPage(Adw.Bin):
         from ui.widgets.add_to_playlist import mark_playlist_used
         mark_playlist_used(target_pid)
 
+        weak_self = weakref.ref(self)
+        client = self.client
         def thread_func():
-            success = self.client.add_playlist_items(target_pid, video_ids)
+            success = client.add_playlist_items(target_pid, video_ids)
             msg = (
                 f"Added {len(video_ids)} tracks to playlist"
                 if success
                 else "Failed to add tracks"
             )
-            GLib.idle_add(self._show_toast, msg)
+            GLib.idle_add(lambda: weak_self()._show_toast(msg) if weak_self() else None)
 
         threading.Thread(target=thread_func, daemon=True).start()
 
@@ -3210,12 +3212,13 @@ class PlaylistPage(Adw.Bin):
                 # The OMV→ATV swap is handled inside add_playlist_items;
                 # it auto-enables for single-item adds (this is the
                 # right-click case) and stays off for bulk.
+                weak_self = weakref.ref(self)
+                client = self.client
                 threading.Thread(
                     target=lambda: (
-                        self.client.add_playlist_items(target_pid, vids),
+                        client.add_playlist_items(target_pid, vids),
                         GLib.idle_add(
-                            self._show_toast,
-                            f"Added {n} track{'s' if n > 1 else ''} to playlist",
+                            lambda: weak_self()._show_toast(f"Added {n} track{'s' if n > 1 else ''} to playlist") if weak_self() else None
                         ),
                     ),
                     daemon=True,

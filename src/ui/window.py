@@ -2,6 +2,7 @@ import colorsys
 import os
 import sys
 import threading
+import weakref
 import gi
 
 gi.require_version("Gtk", "4.0")
@@ -1420,6 +1421,7 @@ class MainWindow(Adw.ApplicationWindow):
             page.load()
 
         nav_page.connect("shown", _on_shown)
+        self._register_alive_page(page)
         nav.push(nav_page)
 
     def _open_downloads_from_menu(self):
@@ -1442,6 +1444,7 @@ class MainWindow(Adw.ApplicationWindow):
             threading.Thread(target=_fetch, daemon=True).start()
 
         nav_page.connect("shown", _on_shown)
+        self._register_alive_page(page)
         nav.push(nav_page)
         page.stack.set_visible_child_name("loading")
 
@@ -2476,6 +2479,7 @@ class MainWindow(Adw.ApplicationWindow):
 
             # Connect to page changes to update Back Button
             nav_view.connect("notify::visible-page", self.update_back_button_visibility)
+            nav_view.connect("popped", self._on_nav_page_popped)
 
             def on_push(nav_view):
                 def tag_match(page_a, page_b) -> bool:
@@ -2544,6 +2548,28 @@ class MainWindow(Adw.ApplicationWindow):
     def set_header_title(self, title):
         pass
 
+    def _register_alive_page(self, page):
+        if not hasattr(self, "_alive_pages"):
+            self._alive_pages = set()
+        self._alive_pages.add(page)
+
+    def _on_nav_page_popped(self, nav_view, nav_page):
+        """Clean up a page after it's been popped from a NavigationView."""
+        child = nav_page.get_child()
+        if child:
+            if hasattr(self, '_alive_pages') and child in self._alive_pages:
+                self._alive_pages.remove(child)
+            if hasattr(child, 'cleanup'):
+                try:
+                    child.cleanup()
+                except Exception as e:
+                    print(f"Error during page cleanup: {e}")
+            try:
+                nav_page.set_child(None)
+            except Exception:
+                pass
+        import gc
+        gc.collect()
 
     def _get_page_content(self, tab_name):
         # Helper to traverse: NavView -> NavPage -> ToolbarView -> Content
@@ -2712,6 +2738,7 @@ class MainWindow(Adw.ApplicationWindow):
         nav_page.connect("shown", _on_shown)
 
         # Push to stack
+        self._register_alive_page(playlist_page)
         active_nav.push(nav_page)
 
         # Connect title change signal
@@ -2769,6 +2796,7 @@ class MainWindow(Adw.ApplicationWindow):
             child=artist_page, title=initial_name if initial_name else f"Artist_{channel_id}"
         )
 
+        self._register_alive_page(artist_page)
         active_nav.push(nav_page)
 
         artist_page.load_artist(channel_id, initial_name)
@@ -2798,6 +2826,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         nav_page = Adw.NavigationPage(child=disco_page, title=title)
 
+        self._register_alive_page(disco_page)
         active_nav.push(nav_page)
 
         disco_page.load_discography(channel_id, title, browse_id, params, initial_items)
@@ -2818,6 +2847,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         nav_page = Adw.NavigationPage(child=mood_page, title=title)
 
+        self._register_alive_page(mood_page)
         active_nav.push(nav_page)
 
         mood_page.load_mood(params, title)
@@ -2843,6 +2873,7 @@ class MainWindow(Adw.ApplicationWindow):
             display_title = "All Moods & Moments"
 
         nav_page = Adw.NavigationPage(child=all_moods_page, title=display_title)
+        self._register_alive_page(all_moods_page)
         active_nav.push(nav_page)
 
     def open_category(self, params, title):
@@ -2859,6 +2890,7 @@ class MainWindow(Adw.ApplicationWindow):
         cat_page.connect("header-title-changed", self.on_playlist_header_title_changed)
 
         nav_page = Adw.NavigationPage(child=cat_page, title=title)
+        self._register_alive_page(cat_page)
         active_nav.push(nav_page)
 
         cat_page.load_category(params, title)

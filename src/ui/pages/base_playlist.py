@@ -436,14 +436,16 @@ class BasePlaylistPage(Adw.Bin):
         from ui.widgets.add_to_playlist import mark_playlist_used
         mark_playlist_used(playlist_id)
 
+        weak_self = weakref.ref(self)
+        client = self.client
         def thread_func():
-            success = self.client.add_playlist_items(playlist_id, video_ids)
+            success = client.add_playlist_items(playlist_id, video_ids)
             if success:
                 msg = f"Added {len(video_ids)} tracks to playlist"
                 print(msg)
-                GLib.idle_add(self._show_toast, msg)
+                GLib.idle_add(lambda: weak_self()._show_toast(msg) if weak_self() else None)
             else:
-                GLib.idle_add(self._show_toast, "Failed to add tracks")
+                GLib.idle_add(lambda: weak_self()._show_toast("Failed to add tracks") if weak_self() else None)
 
         threading.Thread(target=thread_func, daemon=True).start()
 
