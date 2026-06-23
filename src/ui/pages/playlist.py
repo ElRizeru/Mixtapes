@@ -422,7 +422,9 @@ class PlaylistPage(Adw.Bin):
         self.header_store.append(HeaderItem())
 
         self.track_store = Gio.ListStore(item_type=TrackItem)
-        self.track_filter = Gtk.CustomFilter.new(self._track_filter_func, None)
+        self.track_filter = Gtk.CustomFilter.new(
+            lambda item, user_data: weak_self()._track_filter_func(item, user_data) if weak_self() else False, None
+        )
         # Start with no filter attached — Gtk.FilterListModel calls its filter
         # callback (Python!) for every item on every items-changed, which for
         # 989-track playlists meant ~1000 Python↔C crossings *per splice* even
@@ -625,14 +627,12 @@ class PlaylistPage(Adw.Bin):
         left_click.set_button(1)
         weak_self = weakref.ref(self)
         left_click.connect(
-            "pressed", lambda g, n, x, y, : weak_self()._on_row_left_pressed(g, n, x, y, g.get_widget()) if weak_self() and g.get_widget() is not None else None
+            "pressed", lambda g, n, x, y: weak_self()._on_row_left_pressed(g, n, x, y, g.get_widget()) if weak_self() and g.get_widget() is not None else None
         )
         left_click.connect(
             "released", lambda g, n, x, y, li=list_item: weak_self()._on_row_left_click(g, n, x, y, li) if weak_self() else None
         )
         row.add_controller(left_click)
-
-        row._lv_list_item_ref = weakref.ref(list_item)
 
         row._lv_video_data = None
         row._lv_full_track = None
@@ -716,9 +716,10 @@ class PlaylistPage(Adw.Bin):
             if hasattr(row, "_lv_check_handler") and row._lv_check_handler:
                 check.disconnect(row._lv_check_handler)
             check.set_active(is_selected)
+            weak_self = weakref.ref(self)
             row._lv_check_handler = check.connect(
                 "toggled",
-                lambda cb, vid=video_id, : self._toggle_track_selection(vid, g.get_widget()),
+                lambda cb, vid=video_id, r=weakref.ref(row): weak_self()._toggle_track_selection(vid, r()) if weak_self() else None,
             )
         elif row._lv_check is not None:
             row._lv_check.set_visible(False)
@@ -876,6 +877,7 @@ class PlaylistPage(Adw.Bin):
             return
 
         row = bin_widget._lv_track_ui
+        row.insert_action_group("ctx", None)
         # Disconnect player signal
         if row._lv_player_handler is not None:
             try:
@@ -1094,7 +1096,6 @@ class PlaylistPage(Adw.Bin):
         # chunker from a previous render so its scheduled appends get
         # dropped instead of mutating the freshly-cleared store.
         self._track_populate_token = getattr(self, "_track_populate_token", 0) + 1
-
     def _populate_tracks_chunked(self, tracks, first_batch=40, batch=80):
         """Fill the track store without blocking the main thread.
 
@@ -1113,8 +1114,6 @@ class PlaylistPage(Adw.Bin):
         full population (update_ui's non-append branch, reorder_playlist).
         Do NOT mix with other code that splices in parallel — the tail
         splices use `track_store.get_n_items()` and will race."""
-        if getattr(self, "_cleaned_up", False):
-            return
         self._clear_track_store()
         if not tracks:
             return
@@ -1125,8 +1124,6 @@ class PlaylistPage(Adw.Bin):
             return
 
         def pump(cursor):
-            if getattr(self, "_cleaned_up", False):
-                return False
             if token != self._track_populate_token:
                 return False  # superseded
             end = min(cursor + batch, len(tracks))
@@ -1512,54 +1509,6 @@ class PlaylistPage(Adw.Bin):
                 pass
             self._dl_done_id = None
 
-        # Clear track store
-        if hasattr(self, "track_store") and self.track_store:
-            try:
-                self.track_store.remove_all()
-            except Exception:
-                pass
-
-        self.current_tracks = []
-        self.original_tracks = []
-
-        # Recursively cleanup image widgets to cancel pending async loads
-        from ui.utils import cleanup_widget_images
-        cleanup_widget_images(self)
-
-        # Clear references to break reference cycles
-        self.player = None
-        self.client = None
-        self.header_container = None
-        self.header_info_box = None
-        self.cover_img = None
-        self.cover_wrapper = None
-        self.details_col = None
-        self.playlist_name_label = None
-        self.description_label = None
-        self.read_more_btn = None
-        self.desc_box = None
-        self.meta_label = None
-        self.stats_label = None
-        self.actions_box = None
-        self.more_btn = None
-        self.more_menu = None
-        self.sort_row = None
-        self.sort_dropdown = None
-        self.sort_dir_btn = None
-        self.select_btn = None
-        self.selection_bar = None
-        self.selection_label = None
-        self.sel_add_btn = None
-        self.sel_remove_btn = None
-        self.songs_list = None
-        self.vadjust = None
-        self.content_spinner = None
-        self.load_more_spinner = None
-        self.stack = None
-        self.main_box = None
-        self.selection_model = None
-        self.track_store = None
-
     # ── Load playlist ─────────────────────────────────────────────────────────
 
     # Delay the live-data refresh when we already have something to show.
@@ -1776,8 +1725,6 @@ class PlaylistPage(Adw.Bin):
     def _apply_disk_cache_header(self, token, payload):
         """Cheap header updates: title, description, meta strings, cover.
         Safe to run during the page-push animation."""
-        if getattr(self, "_cleaned_up", False):
-            return False
         if token != getattr(self, "_track_populate_token", 0):
             return False
         try:
@@ -1841,8 +1788,6 @@ class PlaylistPage(Adw.Bin):
         Worker has already done JSON parse + TrackItem construction; the
         main thread only owes the splice itself.
         """
-        if getattr(self, "_cleaned_up", False):
-            return False
         if token != getattr(self, "_track_populate_token", 0):
             return False
         try:
@@ -1892,8 +1837,6 @@ class PlaylistPage(Adw.Bin):
         # sees as a hard stutter right after the page opens. Splice in
         # smaller chunks with idle yields between so layout/paint can
         # interleave — total work is the same, but spread across frames.
-        if getattr(self, "_cleaned_up", False):
-            return False
         if token != getattr(self, "_track_populate_token", 0):
             return False
         try:
@@ -2491,8 +2434,6 @@ class PlaylistPage(Adw.Bin):
         total_tracks=None,
         is_owned=False,
     ):
-        if getattr(self, "_cleaned_up", False):
-            return
         self.stack.set_visible_child_name("content")
         self.content_spinner.set_visible(False)
 
@@ -2643,29 +2584,21 @@ class PlaylistPage(Adw.Bin):
     def _start_background_full_fetch(self):
         if getattr(self, "is_fully_fetched", False):
             return
-        if getattr(self, "_cleaned_up", False):
-            return
         print(f"Starting background fetch for full playlist: {self.playlist_id}")
 
         client = self.client
         pid = self.playlist_id
         def fetch_job():
-            if getattr(self, "_cleaned_up", False):
-                return
             try:
                 # get_playlist_full handles the full fetch and (via
                 # MusicClient.get_playlist_full) owns the disk-cache
                 # write once ytmusicapi / raw-continuation / yt_dlp have
                 # done their best. No cache logic here.
                 data = client.get_playlist_full(pid, limit=None)
-                if getattr(self, "_cleaned_up", False):
-                    return
                 tracks = data.get("tracks", []) if data else []
                 if tracks:
                     print(f"Background fetch complete. Fetched {len(tracks)} tracks.")
                     client.set_cached_playlist_tracks(pid, tracks)
-                    if getattr(self, "_cleaned_up", False):
-                        return
                     GObject.idle_add(self._on_background_fetch_complete, tracks)
             except Exception as e:
                 print(f"Error in background fetch: {e}")
@@ -2677,8 +2610,6 @@ class PlaylistPage(Adw.Bin):
         thread.start()
 
     def _on_background_fetch_complete(self, tracks=None):
-        if getattr(self, "_cleaned_up", False):
-            return
         if tracks is not None:
             self.original_tracks = tracks
         self.is_fully_fetched = True
@@ -2855,9 +2786,10 @@ class PlaylistPage(Adw.Bin):
                 else None
             )
             if vid:
+                weak_self = weakref.ref(self)
                 row._lv_check_handler = check.connect(
                     "toggled",
-                    lambda cb, v=vid, : self._toggle_track_selection(v, g.get_widget()),
+                    lambda cb, v=vid, r=weakref.ref(row): weak_self()._toggle_track_selection(v, r()) if weak_self() else None,
                 )
 
     def _refresh_all_row_visuals(self):
@@ -3457,18 +3389,19 @@ class PlaylistPage(Adw.Bin):
             sel_section.append("Deselect All", "ctx.deselect_all")
 
             a_toggle = Gio.SimpleAction.new("toggle_sel", None)
+            weak_self = weakref.ref(self)
             a_toggle.connect(
                 "activate",
-                lambda act, p, v=vid, : self._toggle_track_selection(v, g.get_widget()),
+                lambda act, p, v=vid, r=weakref.ref(row): weak_self()._toggle_track_selection(v, r()) if weak_self() else None,
             )
             group.add_action(a_toggle)
 
             a_sel_all = Gio.SimpleAction.new("select_all", None)
-            a_sel_all.connect("activate", lambda act, p: self._select_all())
+            a_sel_all.connect("activate", lambda act, p: weak_self()._select_all() if weak_self() else None)
             group.add_action(a_sel_all)
 
             a_desel = Gio.SimpleAction.new("deselect_all", None)
-            a_desel.connect("activate", lambda act, p: self._deselect_all())
+            a_desel.connect("activate", lambda act, p: weak_self()._deselect_all() if weak_self() else None)
             group.add_action(a_desel)
 
             menu_model.append_section(None, sel_section)
@@ -3491,7 +3424,8 @@ class PlaylistPage(Adw.Bin):
         if self._multi_select_mode and self._selected_video_ids:
             clip_section.append("Copy Selection Data (Debug)", "ctx.copy_debug")
             a_debug = Gio.SimpleAction.new("copy_debug", None)
-            a_debug.connect("activate", lambda act, p: self._copy_selection_debug())
+            weak_self = weakref.ref(self)
+            a_debug.connect("activate", lambda act, p: weak_self()._copy_selection_debug() if weak_self() else None)
             group.add_action(a_debug)
 
         if clip_section.get_n_items() > 0:
@@ -3533,7 +3467,8 @@ class PlaylistPage(Adw.Bin):
         self.read_more_btn.set_markup(f"<a href='toggle'>{text}</a>")
         self.read_more_btn.add_css_class("caption")
         self.read_more_btn.set_halign(Gtk.Align.START)
-        self.read_more_btn.connect("activate-link", self._on_read_more_clicked)
+        weak_self = weakref.ref(self)
+        self.read_more_btn.connect("activate-link", lambda label, uri: weak_self()._on_read_more_clicked(label, uri) if weak_self() else False)
         parent.append(self.read_more_btn)
         return False
 
@@ -3693,8 +3628,6 @@ class PlaylistPage(Adw.Bin):
         self.load_playlist(pid)
 
     def _reshow_virtual(self, title, tracks, meta1):
-        if getattr(self, "_cleaned_up", False):
-            return
         self.original_tracks = tracks
         self.current_tracks = tracks
         total_seconds = sum(t.get("duration_seconds", 0) or 0 for t in tracks)
@@ -3809,7 +3742,8 @@ class PlaylistPage(Adw.Bin):
         if can_edit:
             action = Gio.SimpleAction.new("edit_playlist", None)
             action.set_enabled(True)
-            action.connect("activate", lambda *_: self._show_edit_dialog())
+            weak_self = weakref.ref(self)
+            action.connect("activate", lambda *_: weak_self()._show_edit_dialog() if weak_self() else None)
             group.add_action(action)
 
         self.cover_wrapper.insert_action_group("cover", group)

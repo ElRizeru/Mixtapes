@@ -28,7 +28,6 @@ class HistoryPage(Adw.Bin):
         super().__init__(*args, **kwargs)
         self.player = player
         weak_self = weakref.ref(self)
-        self.connect("destroy", lambda w: weak_self()._on_page_destroy(w) if weak_self() else None)
         self.client = MusicClient()
         self._tracks = []
         # Collected on each rebuild so set_compact_mode can swap the
@@ -145,17 +144,11 @@ class HistoryPage(Adw.Bin):
             return
 
         def _fetch():
-            if getattr(self, "_cleaned_up", False):
-                return
             tracks = self.client.get_history() or []
-            if getattr(self, "_cleaned_up", False):
-                return
             self._normalize_durations(tracks)
             GLib.idle_add(self._render, tracks)
 
         def _kick():
-            if getattr(self, "_cleaned_up", False):
-                return False
             threading.Thread(target=_fetch, daemon=True).start()
             return False
 
@@ -215,8 +208,6 @@ class HistoryPage(Adw.Bin):
         If async_render is False, all groups are rendered synchronously in a single pass
         without idle scheduling. async_callback will not be called.
         """
-        if getattr(self, "_cleaned_up", False):
-            return
         self._loading_wrap.set_visible(False)
         self._tracks = tracks
         self._row_imgs = []
@@ -406,12 +397,12 @@ class HistoryPage(Adw.Bin):
         click.set_button(3)
         weak_self = weakref.ref(self)
         click.connect(
-            "released", lambda g, n, x, y, : weak_self()._on_row_right_click(g, n, x, y, g.get_widget()) if weak_self() and g.get_widget() is not None else None
+            "released", lambda g, n, x, y: weak_self()._on_row_right_click(g, n, x, y, g.get_widget()) if weak_self() and g.get_widget() is not None else None
         )
         row.add_controller(click)
         lp = Gtk.GestureLongPress()
         lp.connect(
-            "pressed", lambda g, x, y, : weak_self()._on_row_right_click(g, 1, x, y, g.get_widget()) if weak_self() and g.get_widget() is not None else None
+            "pressed", lambda g, x, y: weak_self()._on_row_right_click(g, 1, x, y, g.get_widget()) if weak_self() and g.get_widget() is not None else None
         )
         row.add_controller(lp)
 
@@ -420,7 +411,6 @@ class HistoryPage(Adw.Bin):
     # ── Interactions ───────────────────────────────────────────────────────
 
     def _on_row_activated(self, listbox, row):
-        print(f"ROW ACTIVATED: {row}")
         track = getattr(row, "_track", None)
         if not track or not self._tracks:
             return
@@ -629,52 +619,3 @@ class HistoryPage(Adw.Bin):
             self.content_box.set_margin_start(24)
             self.content_box.set_margin_end(24)
 
-    def _on_page_destroy(self, widget):
-        self.cleanup()
-
-    def cleanup(self):
-        """Clean up resources to prevent memory leaks."""
-        self._cleaned_up = True
-
-        # Disconnect scroll handler
-        if getattr(self, "_scroll_handler_id", None) is not None:
-            if hasattr(self, "scrolled") and self.scrolled:
-                try:
-                    self.scrolled.get_vadjustment().disconnect(self._scroll_handler_id)
-                except Exception:
-                    pass
-            self._scroll_handler_id = None
-
-        from ui.utils import cleanup_widget_images
-        cleanup_widget_images(self)
-
-        self._tracks = []
-        self._row_imgs = []
-
-        if hasattr(self, "sections_box") and self.sections_box:
-            child = self.sections_box.get_first_child()
-            while child:
-                next_child = child.get_next_sibling()
-                try:
-                    self.sections_box.remove(child)
-                except Exception:
-                    pass
-                child = next_child
-
-        if hasattr(self, "scrolled") and self.scrolled:
-            try:
-                self.scrolled.set_child(None)
-            except Exception:
-                pass
-
-        # Clear references to break GObject reference cycles
-        self.player = None
-        self.client = None
-        self.main_box = None
-        self.scrolled = None
-        self.clamp = None
-        self.content_box = None
-        self.title_label = None
-        self.sections_box = None
-        self.empty_label = None
-        self._loading_wrap = None

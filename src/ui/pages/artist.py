@@ -20,7 +20,6 @@ class ArtistPage(Adw.Bin):
         super().__init__(*args, **kwargs)
         self.player = player
         weak_self = weakref.ref(self)
-        self.connect("destroy", lambda w: weak_self()._on_page_destroy(w) if weak_self() else None)
         self.open_playlist_callback = open_playlist_callback
         self.client = MusicClient()
         self.artist_name = ""
@@ -279,8 +278,6 @@ class ArtistPage(Adw.Bin):
         thread.start()
 
     def _fetch_artist(self, channel_id):
-        if getattr(self, "_cleaned_up", False):
-            return
         client = self.client
         if not client:
             return
@@ -376,8 +373,6 @@ class ArtistPage(Adw.Bin):
 
             def detail_fetch(key, browse_id, params):
                 try:
-                    if getattr(self, "_cleaned_up", False):
-                        return
                     # Limit to 10 for the initial view as requested
                     detailed_items = client.get_artist_albums(
                         browse_id, params, limit=10
@@ -424,16 +419,12 @@ class ArtistPage(Adw.Bin):
             for t in detail_threads:
                 t.join(timeout=10.0)  # Generous timeout for multiple deep fetches
 
-            if getattr(self, "_cleaned_up", False):
-                return
             self._is_ui_init = False  # Fresh load
             GLib.idle_add(self.update_ui, self._artist_data)
         except Exception as e:
             print(f"Error fetching artist: {e}")
 
     def update_ui(self, data):
-        if getattr(self, "_cleaned_up", False):
-            return
         if not data:
             return
 
@@ -714,14 +705,14 @@ class ArtistPage(Adw.Bin):
             gesture = Gtk.GestureClick()
             gesture.set_button(3)
             gesture.connect(
-                "pressed", lambda g, n, x, y, : weak_self().on_song_right_click(g, n, x, y, g.get_widget()) if weak_self() and g.get_widget() is not None else None
+                "pressed", lambda g, n, x, y: weak_self().on_song_right_click(g, n, x, y, g.get_widget()) if weak_self() and g.get_widget() is not None else None
             )
             row.add_controller(gesture)
 
             # Long Press for touch
             lp = Gtk.GestureLongPress()
             lp.connect(
-                "pressed", lambda g, x, y, : weak_self().on_song_right_click(g, 1, x, y, g.get_widget()) if weak_self() and g.get_widget() is not None else None
+                "pressed", lambda g, x, y: weak_self().on_song_right_click(g, 1, x, y, g.get_widget()) if weak_self() and g.get_widget() is not None else None
             )
             row.add_controller(lp)
 
@@ -898,10 +889,7 @@ class ArtistPage(Adw.Bin):
 
             inner_box.append(item_box)
 
-            # Keep strong reference to prevent PyGObject from dropping the wrapper
-            if not hasattr(self, '_alive_grid_items'):
-                self._alive_grid_items = []
-            self._alive_grid_items.append(item_box)
+
 
             # Left Click Activation
             click_gesture = Gtk.GestureClick()
@@ -1464,53 +1452,3 @@ class ArtistPage(Adw.Bin):
         else:
             self.emit("header-title-changed", "")
 
-    def _on_page_destroy(self, widget):
-        self.cleanup()
-
-    def cleanup(self):
-        """Clean up resources to prevent memory leaks."""
-        self._cleaned_up = True
-
-        # Disconnect scroll handler
-        if getattr(self, "_scroll_handler_id", None) is not None:
-            if hasattr(self, "vadjust") and self.vadjust:
-                try:
-                    self.vadjust.disconnect(self._scroll_handler_id)
-                except Exception:
-                    pass
-            self._scroll_handler_id = None
-
-        # Disconnect banner fade handler from root window
-        if getattr(self, "_banner_fade_root_handler", None) and hasattr(self, "banner_wrapper"):
-            root = self.banner_wrapper.get_root()
-            if root:
-                try:
-                    root.disconnect(self._banner_fade_root_handler)
-                except Exception:
-                    pass
-            self._banner_fade_root_handler = None
-
-        # Recursively cleanup image widgets to cancel pending async loads
-        from ui.utils import cleanup_widget_images
-        cleanup_widget_images(self)
-
-        self.current_songs = []
-        self._artist_data = None
-        self._section_widgets = {}
-
-        if hasattr(self, "sections_box") and self.sections_box:
-            child = self.sections_box.get_first_child()
-            while child:
-                next_child = child.get_next_sibling()
-                try:
-                    self.sections_box.remove(child)
-                except Exception:
-                    pass
-                child = next_child
-
-        # Clear references to break reference cycles
-        self.player = None
-        self.client = None
-        self.main_box = None
-        self.vadjust = None
-        self.clamp = None

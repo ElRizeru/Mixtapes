@@ -135,6 +135,9 @@ class BasePlaylistPage(Adw.Bin):
         actions_box.set_margin_top(12)
         self.actions_box = actions_box
 
+        play_btn = Gtk.Button(label="Play")
+        play_btn.add_css_class("suggested-action")
+        play_btn.add_css_class("pill")
         play_btn.connect("clicked", lambda btn: weak_self().on_play_clicked(btn) if weak_self() else None)
         actions_box.append(play_btn)
 
@@ -215,7 +218,9 @@ class BasePlaylistPage(Adw.Bin):
         # ListView Setup
         self.store = Gio.ListStore(item_type=SongItem)
         self.filter_model = Gtk.FilterListModel(model=self.store)
-        self.custom_filter = Gtk.CustomFilter.new(self._filter_func)
+        self.custom_filter = Gtk.CustomFilter.new(
+            lambda item: weak_self()._filter_func(item) if weak_self() else False
+        )
         self.filter_model.set_filter(self.custom_filter)
 
         self.sort_model = Gtk.SortListModel(model=self.filter_model)
@@ -305,19 +310,8 @@ class BasePlaylistPage(Adw.Bin):
         self.cleanup()
 
     def cleanup(self):
-        """Perform resource cleanup when the page is popped/destroyed."""
+        """Disconnect long-lived signal handlers that prevent GC."""
         self._cleaned_up = True
-
-        # Disconnect scroll handler
-        if getattr(self, "_scroll_handler_id", None) is not None:
-            if hasattr(self, "vadjust") and self.vadjust:
-                try:
-                    self.vadjust.disconnect(self._scroll_handler_id)
-                except Exception:
-                    pass
-            self._scroll_handler_id = None
-
-        # Disconnect player signals
         hid = getattr(self, "_player_metadata_handler", None)
         if hid is not None:
             try:
@@ -325,25 +319,6 @@ class BasePlaylistPage(Adw.Bin):
             except Exception:
                 pass
             self._player_metadata_handler = None
-
-        # Clear store and tracks to break references
-        if hasattr(self, "store") and self.store:
-            try:
-                self.store.remove_all()
-            except Exception:
-                pass
-        self.current_tracks = []
-        self.original_tracks = []
-
-        # Recursively cleanup image widgets to cancel pending async loads
-        from ui.utils import cleanup_widget_images
-        cleanup_widget_images(self)
-
-        # Clear references to break GObject reference cycles
-        self.player = None
-        self.client = None
-        self.main_box = None
-        self.vadjust = None
 
     def _on_factory_setup(self, factory, list_item):
         widget = SongRowWidget(self.player, self.client)
@@ -489,8 +464,7 @@ class BasePlaylistPage(Adw.Bin):
         append=False,
         total_tracks=None,
     ):
-        if getattr(self, "_cleaned_up", False):
-            return
+
         self.stack.set_visible_child_name("content")
         self.content_spinner.set_visible(False)
         self.playlist_title_text = title

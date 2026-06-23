@@ -16,7 +16,6 @@ class DiscographyPage(Adw.Bin):
         super().__init__(*args, **kwargs)
         self.player = player
         weak_self = weakref.ref(self)
-        self.connect("destroy", lambda w: weak_self()._on_page_destroy(w) if weak_self() else None)
         self.open_playlist_callback = open_playlist_callback
         self.client = MusicClient()
         self.channel_id = None
@@ -159,8 +158,6 @@ class DiscographyPage(Adw.Bin):
             self._load_more()
 
     def _load_more(self):
-        if getattr(self, "_cleaned_up", False):
-            return
         if self._is_loading or not self._has_more:
             return
 
@@ -172,8 +169,6 @@ class DiscographyPage(Adw.Bin):
         p = self.params
         t_title = self.title
         def fetch_func():
-            if getattr(self, "_cleaned_up", False):
-                return
             try:
                 new_items = []
                 if bid and "Top Songs" in t_title:
@@ -196,8 +191,6 @@ class DiscographyPage(Adw.Bin):
                     self._has_more = False
 
                 def update_cb():
-                    if getattr(self, "_cleaned_up", False):
-                        return
                     if new_items:
                         # Filter out items we already have
                         existing_ids = set()
@@ -224,14 +217,11 @@ class DiscographyPage(Adw.Bin):
                     if not new_items:
                         self._has_more = False
 
-                if getattr(self, "_cleaned_up", False):
-                    return
                 GLib.idle_add(update_cb)
             except Exception as e:
                 print(f"Error loading discography: {e}")
-                if not getattr(self, "_cleaned_up", False):
-                    GLib.idle_add(lambda: self._loading_wrap.set_visible(False))
-                    self._is_loading = False
+                GLib.idle_add(lambda: self._loading_wrap.set_visible(False))
+                self._is_loading = False
 
         threading.Thread(target=fetch_func, daemon=True).start()
 
@@ -306,14 +296,14 @@ class DiscographyPage(Adw.Bin):
             gesture.set_button(3)
             weak_self = weakref.ref(self)
             gesture.connect(
-                "pressed", lambda g, n, x, y, : weak_self().on_grid_right_click(g, n, x, y, g.get_widget()) if weak_self() and g.get_widget() is not None else None
+                "pressed", lambda g, n, x, y: weak_self().on_grid_right_click(g, n, x, y, g.get_widget()) if weak_self() and g.get_widget() is not None else None
             )
             item_box.add_controller(gesture)
 
             # Long Press for touch
             lp = Gtk.GestureLongPress()
             lp.connect(
-                "pressed", lambda g, x, y, : weak_self().on_grid_right_click(g, 1, x, y, g.get_widget()) if weak_self() and g.get_widget() is not None else None
+                "pressed", lambda g, x, y: weak_self().on_grid_right_click(g, 1, x, y, g.get_widget()) if weak_self() and g.get_widget() is not None else None
             )
             item_box.add_controller(lp)
 
@@ -433,50 +423,3 @@ class DiscographyPage(Adw.Bin):
                 GLib.idle_add(window.player.extend_queue, tracks)
 
         threading.Thread(target=thread_func, daemon=True).start()
-
-    def _on_page_destroy(self, widget):
-        self.cleanup()
-
-    def cleanup(self):
-        """Clean up resources to prevent memory leaks."""
-        self._cleaned_up = True
-
-        # Disconnect scroll handler
-        if getattr(self, "_scroll_handler_id", None) is not None:
-            if hasattr(self, "scrolled") and self.scrolled:
-                try:
-                    vadjust = self.scrolled.get_vadjustment()
-                    if vadjust:
-                        vadjust.disconnect(self._scroll_handler_id)
-                except Exception:
-                    pass
-            self._scroll_handler_id = None
-
-        from ui.utils import cleanup_widget_images
-        cleanup_widget_images(self)
-
-        self.items = []
-
-        if hasattr(self, "flow_box") and self.flow_box:
-            child = self.flow_box.get_first_child()
-            while child:
-                next_child = child.get_next_sibling()
-                try:
-                    self.flow_box.remove(child)
-                except Exception:
-                    pass
-                child = next_child
-
-        if hasattr(self, "scrolled") and self.scrolled:
-            try:
-                self.scrolled.set_child(None)
-            except Exception:
-                pass
-
-        # Clear references to break reference cycles
-        self.player = None
-        self.client = None
-        self.main_box = None
-        self.scrolled = None
-        self.flow_box = None
-        self.content_box = None

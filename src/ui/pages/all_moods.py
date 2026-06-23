@@ -10,7 +10,6 @@ class AllMoodsPage(Adw.Bin):
     def __init__(self, items, title, *args, **kwargs):
         super().__init__(*args, **kwargs)
         weak_self = weakref.ref(self)
-        self.connect("destroy", lambda w: weak_self()._on_page_destroy(w) if weak_self() else None)
         self.items = items
         self.category_title = title
 
@@ -106,32 +105,3 @@ class AllMoodsPage(Adw.Bin):
             if hasattr(root, "open_category"):
                 nav_title = item.get("title", self.category_title)
                 root.open_category(item["params"], nav_title)
-
-    def _on_page_destroy(self, widget):
-        self.cleanup()
-
-    def cleanup(self):
-        """Clean up resources to prevent memory leaks."""
-        self._cleaned_up = True
-        self.items = []
-        if hasattr(self, "list_box") and self.list_box:
-            child = self.list_box.get_first_child()
-            while child:
-                next_child = child.get_next_sibling()
-                try:
-                    self.list_box.remove(child)
-                except Exception:
-                    pass
-                child = next_child
-        if hasattr(self, "scrolled") and self.scrolled:
-            try:
-                self.scrolled.set_child(None)
-            except Exception:
-                pass
-
-        # Clear references to break reference cycles
-        self.list_box = None
-        self.scrolled = None
-        self.main_box = None
-        self.content_box = None
-        self.clamp = None
