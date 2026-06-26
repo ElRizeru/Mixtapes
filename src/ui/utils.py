@@ -101,19 +101,18 @@ def invalidate_is_online_cache():
     with _IS_ONLINE_LOCK:
         _IS_ONLINE_STATE["last_probe"] = 0.0
 
-# Bounded LRU Cache to prevent memory leaks (max 100 images). The cache is
+# Bounded LRU Cache to prevent memory leaks. The cache is
 # read/written by multiple worker threads and the main thread, so every
 # mutation is serialized through IMG_CACHE_LOCK — concurrent check-then-modify
 # sequences were corrupting LRU state and evicting pixbufs that other threads
 # were still wiring up into textures.
 IMG_CACHE = collections.OrderedDict()
-# Each cached pixbuf is up to MAX_CACHED_DIM² × 4 bytes. At the old 1600/100
-# settings the cache could pin ~1 GB by itself. The largest on-screen cover
-# is the full-window cover view, which is comfortably served by 1024 even on
-# HiDPI; song-row thumbnails are 56px. Keeping headroom for ~64 covers at
-# 1024² × 4 B ≈ 4 MB each → ~256 MB hard ceiling.
-MAX_CACHE_SIZE = 64
-MAX_CACHED_DIM = 1024
+# Each cached pixbuf is up to MAX_CACHED_DIM² × 4 bytes. A 64-entry cache at
+# 1024px can pin ~256 MB by itself after playlist/queue browsing. Keep enough
+# warm artwork for the current view and nearby tracks without letting decoded
+# covers dominate the process footprint.
+MAX_CACHE_SIZE = 24
+MAX_CACHED_DIM = 768
 IMG_CACHE_LOCK = threading.Lock()
 
 # Bounded executor for image fetches. Each row's `load_url` used to spawn a
@@ -140,12 +139,11 @@ def _get_fetch_executor():
     with _FETCH_EXECUTOR_LOCK:
         if _FETCH_EXECUTOR is None:
             from concurrent.futures import ThreadPoolExecutor
-            # 4 workers keeps the pipeline saturated for image fetches (which
-            # release the GIL during decode + SSL) without putting so many
-            # Python-wrapper threads on the GIL that the UI thread starves
-            # waiting its turn during a heavy bind storm.
+            # Keep decode concurrency low: GdkPixbuf/PIL bursts can otherwise
+            # briefly allocate hundreds of MB while several covers decode and
+            # downscale at the same time.
             _FETCH_EXECUTOR = ThreadPoolExecutor(
-                max_workers=4, thread_name_prefix="muse-img"
+                max_workers=2, thread_name_prefix="muse-img"
             )
     return _FETCH_EXECUTOR
 
@@ -310,6 +308,24 @@ def cache_pixbuf(url, pixbuf):
         IMG_CACHE[url] = pixbuf
         if len(IMG_CACHE) > MAX_CACHE_SIZE:
             IMG_CACHE.popitem(last=False)
+
+
+def decode_pixbuf_bounded(data, max_dim=MAX_CACHED_DIM):
+    """Decode image bytes with a hard dimension cap applied during load."""
+    loader = GdkPixbuf.PixbufLoader()
+
+    def _on_size_prepared(loader, width, height):
+        if width <= 0 or height <= 0:
+            return
+        if width <= max_dim and height <= max_dim:
+            return
+        scale = max_dim / max(width, height)
+        loader.set_size(max(1, int(width * scale)), max(1, int(height * scale)))
+
+    loader.connect("size-prepared", _on_size_prepared)
+    loader.write(data)
+    loader.close()
+    return loader.get_pixbuf()
 
 
 def get_high_res_url(url, target_size=None):
@@ -834,12 +850,32 @@ class AsyncImage(Gtk.Image):
         self._is_placeholder = True
         self.url = url
         self.circular = circular
+        self.video_id = None
+        self._pending_fetch = None
+        self._map_handler_id = None
+        self.connect("destroy", self._on_destroy)
         # Remember the desktop size so set_compact() can restore it
         # when compact mode toggles off. Mirrors AsyncPicture.target_size.
         self._base_size = self.target_w
 
         if url:
             self.load_url(url)
+
+    def _on_destroy(self, *_):
+        self._pending_fetch = None
+        self.url = None
+        self.video_id = None
+        handler_id = getattr(self, "_map_handler_id", None)
+        if handler_id:
+            try:
+                self.disconnect(handler_id)
+            except Exception:
+                pass
+            self._map_handler_id = None
+        try:
+            self.clear()
+        except Exception:
+            pass
 
     def set_compact(self, compact):
         """Switch between desktop and mobile sizing. Only applies to
@@ -990,22 +1026,9 @@ class AsyncImage(Gtk.Image):
                         data = resp.content
                         write_thumb_cache(url, data)
 
-                loader = GdkPixbuf.PixbufLoader()
-                loader.write(data)
-                loader.close()
-                pixbuf = loader.get_pixbuf()
+                pixbuf = decode_pixbuf_bounded(data)
 
                 if pixbuf:
-                    w = pixbuf.get_width()
-                    h = pixbuf.get_height()
-                    if w > MAX_CACHED_DIM or h > MAX_CACHED_DIM:
-                        scale = MAX_CACHED_DIM / max(w, h)
-                        pixbuf = pixbuf.scale_simple(
-                            int(w * scale),
-                            int(h * scale),
-                            GdkPixbuf.InterpType.BILINEAR,
-                        )
-
                     cache_pixbuf(url, pixbuf)
 
             if pixbuf:
@@ -1143,6 +1166,9 @@ class AsyncPicture(Gtk.Picture):
         self.url = url
         self.video_id = None
         self._is_placeholder = True
+        self._pending_fetch = None
+        self._map_handler_id = None
+        self.connect("destroy", self._on_destroy)
 
         # Constrain the picture widget to target_size so it doesn't
         # request more space when a non-square texture is loaded
@@ -1161,6 +1187,22 @@ class AsyncPicture(Gtk.Picture):
             self._is_placeholder = True
             if url:
                 self.load_url(url)
+
+    def _on_destroy(self, *_):
+        self._pending_fetch = None
+        self.url = None
+        self.video_id = None
+        handler_id = getattr(self, "_map_handler_id", None)
+        if handler_id:
+            try:
+                self.disconnect(handler_id)
+            except Exception:
+                pass
+            self._map_handler_id = None
+        try:
+            self.set_paintable(None)
+        except Exception:
+            pass
 
     def do_measure(self, orientation, for_size):
         """Clamp natural size so the texture doesn't inflate the parent.
@@ -1315,24 +1357,11 @@ class AsyncPicture(Gtk.Picture):
                     data = resp.content
                     write_thumb_cache(url, data)
 
-            loader = GdkPixbuf.PixbufLoader()
-            loader.write(data)
-            loader.close()
-            pixbuf = loader.get_pixbuf()
+            pixbuf = decode_pixbuf_bounded(data)
 
             if pixbuf:
                 w = pixbuf.get_width()
                 h = pixbuf.get_height()
-
-                if w > MAX_CACHED_DIM or h > MAX_CACHED_DIM:
-                    scale = MAX_CACHED_DIM / max(w, h)
-                    pixbuf = pixbuf.scale_simple(
-                        int(w * scale),
-                        int(h * scale),
-                        GdkPixbuf.InterpType.BILINEAR,
-                    )
-                    w = pixbuf.get_width()
-                    h = pixbuf.get_height()
 
                 # Cache the high-res version BEFORE potential thumbnail downscaling
                 cache_pixbuf(url, pixbuf)
