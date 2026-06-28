@@ -2,6 +2,7 @@ from gi.repository import Gtk, Adw, GObject, GLib, Pango, Gio, Gdk
 import threading
 from api.client import MusicClient
 from ui.utils import AsyncPicture, LikeButton, parse_item_metadata, attach_playing_highlight
+from ui.util_classes import ScrolledWindow
 
 
 class SearchPage(Adw.Bin):
@@ -23,7 +24,7 @@ class SearchPage(Adw.Bin):
         self.stack.set_vexpand(True)
 
         # 1. Results View
-        results_scrolled = Gtk.ScrolledWindow()
+        results_scrolled = ScrolledWindow()
         results_scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
 
         results_clamp = Adw.Clamp()
@@ -58,7 +59,7 @@ class SearchPage(Adw.Bin):
         self.stack.add_named(loading_box, "loading")
 
         # 3. Explore View (Default)
-        explore_scrolled = Gtk.ScrolledWindow()
+        explore_scrolled = ScrolledWindow()
         explore_scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
 
         # Clamp for Explore

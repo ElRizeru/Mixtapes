@@ -9,6 +9,8 @@ gi.require_version("Adw", "1")
 
 from gi.repository import Gtk, Gdk, Adw, GObject, Gio, GLib, Pango
 from player.player import Player
+from ui.util_classes import ScrolledWindow
+
 
 HAS_TRAY = False
 if sys.platform == "win32":
@@ -336,7 +338,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._dl_popover = Gtk.Popover()
         self._dl_popover.set_size_request(300, -1)
         self._dl_popover.set_parent(self._download_progress_btn)
-        dl_scroll = Gtk.ScrolledWindow()
+        dl_scroll = ScrolledWindow()
         dl_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         dl_scroll.set_max_content_height(400)
         dl_scroll.set_propagate_natural_height(True)
@@ -427,7 +429,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.main_stack.set_transition_duration(300)
 
         # Main Content Area (Scrolled Browser)
-        self.content_bin = Gtk.ScrolledWindow()
+        self.content_bin = ScrolledWindow()
         self.content_bin.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
         self.content_bin.set_child(self.view_stack)
 
@@ -1411,15 +1413,13 @@ class MainWindow(Adw.ApplicationWindow):
         page = HistoryPage(self.player)
         if getattr(self, "_is_compact", False):
             page.set_compact_mode(True)
-        # Paint cached rows BEFORE the push so the pushed page arrives
-        # already populated — otherwise the forward-nav slide shows a
-        # blank surface for the 350ms until the fresh fetch lands.
-        page.load_cached()
         nav_page = Adw.NavigationPage(child=page, title="Listening History")
+
+        def _on_shown(p):
+            page.load()
+
+        nav_page.connect("shown", _on_shown)
         nav.push(nav_page)
-        # Fresh fetch runs after the transition so it doesn't compete
-        # for frame time with the slide animation.
-        page.refresh_from_server(delay_ms=350)
 
     def _open_downloads_from_menu(self):
         """Push the Downloads PlaylistPage onto the visible tab's nav
@@ -1436,6 +1436,11 @@ class MainWindow(Adw.ApplicationWindow):
         if getattr(self, "_is_compact", False):
             page.set_compact_mode(True)
         nav_page = Adw.NavigationPage(child=page, title="Downloaded Songs")
+
+        def _on_shown(page):
+            threading.Thread(target=_fetch, daemon=True).start()
+
+        nav_page.connect("shown", _on_shown)
         nav.push(nav_page)
         page.stack.set_visible_child_name("loading")
 
@@ -1464,8 +1469,6 @@ class MainWindow(Adw.ApplicationWindow):
                     t["duration"] = f"{dur // 60}:{dur % 60:02d}"
                 tracks.append(t)
             GLib.idle_add(self._fill_downloads_page, page, tracks)
-
-        threading.Thread(target=_fetch, daemon=True).start()
 
     def _fill_downloads_page(self, page, tracks):
         page.original_tracks = tracks
@@ -2421,6 +2424,41 @@ class MainWindow(Adw.ApplicationWindow):
         self._avatar_channel_btn.set_sensitive(False)
 
     def init_pages(self):
+
+        # patching Adw.NavigationView's push() to not push into the same page as the current visible page
+        # takes the original push() function, and replaces it with additional checks before calling the original push() function
+        if not getattr(Adw.NavigationView, '_push_patched', False):
+            original_push = Adw.NavigationView.push
+
+            # if both pages have tags, the patch_push checks if the tags between the visible page and the page to push
+            # if the tags are the same, then no push is called
+            #
+            # if tag checks is invalid, then the patch_push checkes the title
+            # if titles are the same, then no push is called
+            def patch_push(self, page):
+                def tag_diff(page_a, page_b) -> bool:
+                    tag_a = page_a.get_tag()
+                    tag_b = page_b.get_tag()
+                    return tag_a != None and tag_b != None and tag_a != tag_b
+                
+                def title_match(page_a, page_b) -> bool:
+                    title_a = page_a.get_title()
+                    title_b = page_b.get_title()
+                    return title_a == title_b
+
+                current = self.get_visible_page()
+
+                if current is None:
+                    original_push(self, page)
+                    return
+                
+                if tag_diff(current, page) or not title_match(current, page):
+                    original_push(self, page)
+                    return
+
+            Adw.NavigationView.push = patch_push
+            Adw.NavigationView._push_patched = True
+
         # PlaylistPage imported at top level now
 
         # Create Pages
@@ -2437,6 +2475,29 @@ class MainWindow(Adw.ApplicationWindow):
 
             # Connect to page changes to update Back Button
             nav_view.connect("notify::visible-page", self.update_back_button_visibility)
+
+            def on_push(nav_view):
+                def tag_match(page_a, page_b) -> bool:
+                    tag_a = page_a.get_tag()
+                    tag_b = page_b.get_tag()
+                    return tag_a != None and tag_b != None and tag_a == tag_b
+                
+                def title_match(page_a, page_b) -> bool:
+                    title_a = page_a.get_title()
+                    title_b = page_b.get_title()
+                    return title_a == title_b
+
+                stack = list(nav_view.get_navigation_stack())
+                current_page = nav_view.get_visible_page()
+
+                # just removing the first matching page should be enough 
+                # because there shouldnt be more than one that exists in the current stack
+                for i, p in enumerate(stack[:max(len(stack)-1, 0)]):
+                    if tag_match(p, current_page) or title_match(p, current_page):
+                        nav_view.replace(stack[:i] + stack[i+1:])
+                        return
+
+            nav_view.connect("pushed", on_push)
 
             return nav_view
 
@@ -2640,13 +2701,16 @@ class MainWindow(Adw.ApplicationWindow):
         # PlaylistPage already has a ToolbarView/Header internally.
         # Adw.NavigationView expects Adw.NavigationPage.
         # Adw.NavigationPage expects a child widget.
-        nav_page = Adw.NavigationPage(child=playlist_page, title="Playlist")
+        nav_page = Adw.NavigationPage(child=playlist_page, title=f"Playlist_{playlist_id}")
+
+        # Load data
+        def _on_shown(page):
+            playlist_page.load_playlist(playlist_id, initial_data)
+
+        nav_page.connect("shown", _on_shown)
 
         # Push to stack
         active_nav.push(nav_page)
-
-        # Load data
-        playlist_page.load_playlist(playlist_id, initial_data)
 
         # Connect title change signal
         playlist_page.connect(
@@ -2700,7 +2764,7 @@ class MainWindow(Adw.ApplicationWindow):
         artist_page = ArtistPage(self.player, self.open_playlist)
 
         nav_page = Adw.NavigationPage(
-            child=artist_page, title=initial_name if initial_name else "Artist"
+            child=artist_page, title=initial_name if initial_name else f"Artist_{channel_id}"
         )
 
         active_nav.push(nav_page)

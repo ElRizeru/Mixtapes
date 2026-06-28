@@ -4,6 +4,7 @@ from gi.repository import Gtk, Adw, GObject, GLib, Gdk, Gio, Pango
 import threading
 from api.client import MusicClient
 from ui.utils import show_toast
+from ui.util_classes import ScrolledWindow
 
 
 LIBRARY_VIEW_MODES = ("list", "grid")
@@ -136,13 +137,9 @@ class LibraryPage(Adw.Bin):
         self.lib_stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
 
         # Single scrolled window for the whole page
-        scrolled = Gtk.ScrolledWindow()
+        scrolled = ScrolledWindow()
         scrolled.set_vexpand(True)
         scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        # Suppress hover-background fades while scrolling — they cause stutter
-        # when the pointer sits over cards/rows that slide past it.
-        from ui.utils import suppress_hover_while_scrolling
-        suppress_hover_while_scrolling(scrolled)
 
         clamp = Adw.Clamp()
         # Match PlaylistPage's width so the Library/Explore/Playlist views

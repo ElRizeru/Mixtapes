@@ -3,6 +3,7 @@ import threading
 import json
 from api.client import MusicClient
 from ui.utils import AsyncImage, parse_item_metadata
+from ui.util_classes import ScrolledWindow
 
 
 class DiscographyPage(Adw.Bin):
@@ -30,7 +31,7 @@ class DiscographyPage(Adw.Bin):
         # Header Bar removed because Adw.NavigationPage handles it
 
         # Scrolled Window
-        self.scrolled = Gtk.ScrolledWindow()
+        self.scrolled = ScrolledWindow()
         self.scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         self.scrolled.set_vexpand(True)
 

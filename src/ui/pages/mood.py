@@ -2,6 +2,8 @@ from gi.repository import Gtk, Adw, GObject, GLib, Gio, Pango, Gdk
 import threading
 from api.client import MusicClient
 from ui.utils import AsyncImage
+from ui.util_classes import ScrolledWindow
+
 
 class MoodPage(Adw.Bin):
     __gsignals__ = {
@@ -22,7 +24,7 @@ class MoodPage(Adw.Bin):
         self.main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
 
         # Scrolled Window
-        self.scrolled = Gtk.ScrolledWindow()
+        self.scrolled = ScrolledWindow()
         self.scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         self.scrolled.set_vexpand(True)
 

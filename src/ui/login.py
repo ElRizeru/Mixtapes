@@ -6,6 +6,8 @@ gi.require_version("Adw", "1")
 from gi.repository import Gtk, Adw, GObject
 
 from api.client import MusicClient
+from ui.util_classes import ScrolledWindow
+
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -124,7 +126,7 @@ class LoginDialog(Adw.Window):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
 
         # Text Area for headers
-        scrolled = Gtk.ScrolledWindow()
+        scrolled = ScrolledWindow()
         scrolled.set_vexpand(True)
         scrolled.set_min_content_height(300)  # Give it some height
 

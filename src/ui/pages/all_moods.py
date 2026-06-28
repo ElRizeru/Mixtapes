@@ -1,4 +1,5 @@
 from gi.repository import Gtk, Adw, GObject
+from ui.util_classes import ScrolledWindow
 
 class AllMoodsPage(Adw.Bin):
     __gsignals__ = {
@@ -12,7 +13,7 @@ class AllMoodsPage(Adw.Bin):
 
         self.main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
 
-        self.scrolled = Gtk.ScrolledWindow()
+        self.scrolled = ScrolledWindow()
         self.scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         self.scrolled.set_vexpand(True)
 
@@ -100,5 +101,5 @@ class AllMoodsPage(Adw.Bin):
         if "params" in item:
             root = self.get_root()
             if hasattr(root, "open_category"):
-                nav_title = item.get("title", "Category")
+                nav_title = item.get("title", self.category_title)
                 root.open_category(item["params"], nav_title)

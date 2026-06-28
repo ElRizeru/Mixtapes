@@ -6,6 +6,7 @@ gi.require_version("Adw", "1")
 from gi.repository import Gtk, Adw, GObject, Pango, Gdk, Gio, GLib
 
 from ui.utils import show_toast
+from ui.util_classes import ScrolledWindow
 
 
 class QueueItem(GObject.Object):
@@ -250,7 +251,7 @@ class QueuePanel(Gtk.Box):
 
         self.list_view = Gtk.ListView(model=self.selection_model, factory=factory)
 
-        scrolled = Gtk.ScrolledWindow()
+        scrolled = ScrolledWindow()
         scrolled.set_vexpand(True)
         scrolled.set_child(self.list_view)
         self.append(scrolled)

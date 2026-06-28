@@ -24,6 +24,7 @@ import time
 from gi.repository import Gtk, Adw, GObject, GLib, Pango, Graphene
 
 from ui.widgets.fade_edges_bin import FadeEdgesBin
+from ui.util_classes import ScrolledWindow
 
 
 # Pango's "alpha" attribute takes a 16-bit value where 65535 = fully opaque.
@@ -237,7 +238,7 @@ class LyricsView(Gtk.Box):
         self.stack.add_named(self.status_page, "empty")
 
         # --- Lyrics page ---
-        self.scroller = Gtk.ScrolledWindow()
+        self.scroller = ScrolledWindow()
         self.scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         self.scroller.set_hexpand(True)
         self.scroller.set_vexpand(True)

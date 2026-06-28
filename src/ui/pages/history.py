@@ -1,9 +1,11 @@
 import threading
+from typing import Callable
 
 from gi.repository import Gtk, Adw, GLib, Gio, Gdk, GObject, Pango
 
 from api.client import MusicClient
 from ui.utils import AsyncPicture, LikeButton
+from ui.util_classes import ScrolledWindow
 
 
 class HistoryPage(Adw.Bin):
@@ -34,7 +36,7 @@ class HistoryPage(Adw.Bin):
         self.main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.set_child(self.main_box)
 
-        self.scrolled = Gtk.ScrolledWindow()
+        self.scrolled = ScrolledWindow()
         self.scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         self.scrolled.set_vexpand(True)
 
@@ -79,7 +81,7 @@ class HistoryPage(Adw.Bin):
         self._loading_wrap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         self._loading_wrap.set_valign(Gtk.Align.CENTER)
         self._loading_wrap.set_halign(Gtk.Align.CENTER)
-        self._loading_wrap.set_visible(False)
+        self._loading_wrap.set_visible(True)
         spinner = Adw.Spinner()
         spinner.set_size_request(48, 48)
         self._loading_wrap.append(spinner)
@@ -100,26 +102,30 @@ class HistoryPage(Adw.Bin):
     # ── Loading ────────────────────────────────────────────────────────────
 
     def load(self):
-        """Kick off the initial render. Cached tracks render synchronously
-        so the page isn't blank during a forward-nav transition; the
-        fresh fetch is deferred behind the animation."""
-        self.load_cached()
-        self.refresh_from_server(delay_ms=0)
+        """Kick off the initial render.
 
-    def load_cached(self):
-        """Paint the cached history immediately. Intended to run before
-        the nav animation so the pushed page isn't blank."""
+        Cached tracks are loaded and rendered asynchronously. Once cached rendering completes,
+        a refresh callback is triggered to fetch fresh history from the server.
+        """
+        self._load_cached(async_render=True, async_callback=self.refresh_from_server)
+
+    def _load_cached(self, async_render=False, async_callback: Callable[[], None]=lambda:None):
         if not self.client.is_authenticated():
             self._show_empty("Sign in to view listening history.")
             return
         cached = self.client.get_cached_history() or []
         if cached:
             self._normalize_durations(cached)
-            self._render(cached)
+            self._render(cached, async_render=async_render, async_callback=async_callback)
         else:
             self._clear_sections()
             self.empty_label.set_visible(False)
             self._loading_wrap.set_visible(True)
+
+    def load_cached(self):
+        """Paint the cached history immediately. Intended to run before
+        the nav animation so the pushed page isn't blank."""
+        self._load_cached()
 
     def refresh_from_server(self, delay_ms=0):
         """Fetch fresh history and re-render. `delay_ms` lets callers
@@ -187,7 +193,16 @@ class HistoryPage(Adw.Bin):
                 if real_artists:
                     t["artist"] = ", ".join(real_artists)
 
-    def _render(self, tracks):
+    def _render(self, tracks, async_render=False, async_callback: Callable[[], None]=lambda:None):
+        """Renders the given tracks onto the page.
+
+        If async_render is True, rendering is performed incrementally using GLib.idle_add,
+        processing one group per idle cycle. async_callback (if provided) is called once
+        rendering completes (when idle returns False).
+
+        If async_render is False, all groups are rendered synchronously in a single pass
+        without idle scheduling. async_callback will not be called.
+        """
         self._loading_wrap.set_visible(False)
         self._tracks = tracks
         self._row_imgs = []
@@ -202,19 +217,32 @@ class HistoryPage(Adw.Bin):
 
         # Group by the `played` header YT Music attaches to each track.
         # Tracks that somehow lack a value fall back to "Recently".
-        groups = []  # [(title, [tracks])], preserves YT's order
         by_title = {}
         for idx, t in enumerate(tracks):
             t["_history_index"] = idx
             key = t.get("played") or "Recently"
             if key not in by_title:
-                lst = []
-                by_title[key] = lst
-                groups.append((key, lst))
+                by_title[key] = []
             by_title[key].append(t)
 
-        for title, group_tracks in groups:
-            self.sections_box.append(self._make_section(title, group_tracks))
+        groups = by_title.items()  # [(title, [tracks])], preserves YT's order
+
+        if async_render:
+            groups_iter = iter(groups)
+
+            def _render_by_group():
+                item = next(groups_iter, None)
+                if item is None:
+                    async_callback()
+                    return False
+                title, group_tracks = item
+                self.sections_box.append(self._make_section(title, group_tracks))
+                return True
+
+            GLib.idle_add(_render_by_group)
+        else:
+            for title, group_tracks in groups:
+                self.sections_box.append(self._make_section(title, group_tracks))
 
     def _show_empty(self, msg):
         self._loading_wrap.set_visible(False)

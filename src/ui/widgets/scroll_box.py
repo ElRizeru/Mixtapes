@@ -1,11 +1,12 @@
 from gi.repository import Gtk, GLib
+from ui.util_classes import ScrolledWindow
 
 class HorizontalScrollBox(Gtk.Overlay):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
         # Scrolled Window
-        self.scrolled = Gtk.ScrolledWindow()
+        self.scrolled = ScrolledWindow()
         self.scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
         self.scrolled.set_hexpand(True)
         self.scrolled.set_min_content_height(-1)
