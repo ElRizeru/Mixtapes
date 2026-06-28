@@ -1,6 +1,35 @@
 import sys
 import os
 
+# ── glibc malloc arena cap (Linux only) ───────────────────────────────────
+# GStreamer decodes audio on short-lived streaming threads, and glibc gives
+# each thread its own malloc "arena" (default cap: 8 × CPU cores). Those
+# arenas grow to peak usage but never shrink, so every track change stranded
+# ~tens of MB of freed-but-retained decode buffers in a fresh arena — RSS
+# climbed ~100 MB per skip and never came back (malloc_trim can't reach
+# per-thread arenas). Capping arenas at 2 forces threads to share and reuse
+# freed space, which flattens the growth to a few MB.
+#
+# glibc reads this only at heap init, so it MUST be in the environment before
+# the process touches the heap. Setting os.environ here would be too late, so
+# we re-exec once with the variable applied. This also covers frozen/AppImage
+# builds where start.sh's environment never runs. The guard (var-not-present)
+# makes the re-exec fire at most once; the child inherits the var and skips it.
+if sys.platform.startswith("linux") and "MALLOC_ARENA_MAX" not in os.environ:
+    os.environ["MALLOC_ARENA_MAX"] = "2"
+    if os.environ.get("MUSE_NO_ARENA_REEXEC") != "1":
+        try:
+            # Frozen builds (Nuitka/PyInstaller): argv[0] is the executable
+            # itself, so don't prepend the interpreter a second time.
+            if getattr(sys, "frozen", False):
+                os.execv(sys.executable, [sys.executable] + sys.argv[1:])
+            else:
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+        except Exception as _e:
+            # Re-exec failed (no exec perms, odd launcher) — carry on. The var
+            # is still set for threads spawned later, which helps partially.
+            print(f"[MALLOC] arena re-exec skipped: {_e}")
+
 # On Windows, set AppUserModelID so the taskbar shows our icon, not Python's
 if sys.platform == "win32":
     try:
