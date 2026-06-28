@@ -7,6 +7,8 @@ import io
 import os
 import re
 import threading
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 
 from gi.repository import GLib
 
@@ -17,8 +19,11 @@ from ui.utils import (
 )
 
 
-_blur_cache = {}    # url -> path to blurred PNG
-_color_cache = {}   # url -> (r, g, b) normalized 0..1
+MAX_BLUR_CACHE_ENTRIES = 48
+MAX_COLOR_CACHE_ENTRIES = 128
+_cache_lock = threading.Lock()
+_blur_cache = OrderedDict()    # cache key -> path to blurred PNG
+_color_cache = OrderedDict()   # url -> (r, g, b) normalized 0..1
 
 # Coalesce concurrent _ensure_image_bytes() calls for the same URL. On a
 # track change the blur + accent-color workers both run on their own
@@ -28,6 +33,46 @@ _color_cache = {}   # url -> (r, g, b) normalized 0..1
 # disk cache.
 _inflight_lock = threading.Lock()
 _inflight = {}  # url -> threading.Event
+_effect_executor = ThreadPoolExecutor(
+    max_workers=2,
+    thread_name_prefix="muse-cover-effects",
+)
+
+
+def _submit_effect_worker(fn):
+    _effect_executor.submit(fn)
+
+
+def _remember_blur_cache(cache_key, path):
+    with _cache_lock:
+        _blur_cache[cache_key] = path
+        _blur_cache.move_to_end(cache_key)
+        while len(_blur_cache) > MAX_BLUR_CACHE_ENTRIES:
+            _blur_cache.popitem(last=False)
+
+
+def _get_blur_cache(cache_key):
+    with _cache_lock:
+        path = _blur_cache.get(cache_key)
+        if path is not None:
+            _blur_cache.move_to_end(cache_key)
+        return path
+
+
+def _remember_color_cache(url, color):
+    with _cache_lock:
+        _color_cache[url] = color
+        _color_cache.move_to_end(url)
+        while len(_color_cache) > MAX_COLOR_CACHE_ENTRIES:
+            _color_cache.popitem(last=False)
+
+
+def _get_color_cache(url):
+    with _cache_lock:
+        color = _color_cache.get(url)
+        if color is not None:
+            _color_cache.move_to_end(url)
+        return color
 
 
 def _blur_cache_dir():
@@ -162,7 +207,7 @@ def get_blurred_cover(
         return
 
     cache_key = (url, blur_radius, output_size, tuple(tint))
-    cached_path = _blur_cache.get(cache_key)
+    cached_path = _get_blur_cache(cache_key)
     if cached_path and os.path.exists(cached_path):
         if callback:
             GLib.idle_add(callback, cached_path)
@@ -174,7 +219,7 @@ def get_blurred_cover(
         f"{_thumb_cache_key(url)}_b{blur_radius}_s{output_size}_{tint_tag}.png",
     )
     if os.path.exists(out_path):
-        _blur_cache[cache_key] = out_path
+        _remember_blur_cache(cache_key, out_path)
         if callback:
             GLib.idle_add(callback, out_path)
         return
@@ -211,7 +256,7 @@ def get_blurred_cover(
             tmp_path = out_path + ".tmp"
             img.save(tmp_path, "PNG", optimize=True)
             os.replace(tmp_path, out_path)
-            _blur_cache[cache_key] = out_path
+            _remember_blur_cache(cache_key, out_path)
             if callback:
                 GLib.idle_add(callback, out_path)
         except Exception as e:
@@ -219,7 +264,7 @@ def get_blurred_cover(
             if callback:
                 GLib.idle_add(callback, None)
 
-    threading.Thread(target=_worker, daemon=True).start()
+    _submit_effect_worker(_worker)
 
 
 # ─── Dominant color extraction ─────────────────────────────────────────────
@@ -242,7 +287,7 @@ def get_dominant_color(url, callback=None):
             GLib.idle_add(callback, None)
         return
 
-    cached = _color_cache.get(url)
+    cached = _get_color_cache(url)
     if cached is not None:
         if callback:
             GLib.idle_add(callback, cached)
@@ -291,7 +336,7 @@ def get_dominant_color(url, callback=None):
                 best = (r / 255.0, g / 255.0, b / 255.0)
 
             if best is not None:
-                _color_cache[url] = best
+                _remember_color_cache(url, best)
             if callback:
                 GLib.idle_add(callback, best)
         except Exception as e:
@@ -299,4 +344,4 @@ def get_dominant_color(url, callback=None):
             if callback:
                 GLib.idle_add(callback, None)
 
-    threading.Thread(target=_worker, daemon=True).start()
+    _submit_effect_worker(_worker)

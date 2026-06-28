@@ -6,6 +6,10 @@ from ui.widgets.lyrics_view import LyricsView
 from ui.util_classes import ScrolledWindow
 
 
+MAX_CAROUSEL_COVERS = 31
+CAROUSEL_PRELOAD_RADIUS = 5
+
+
 class ExpandedPlayer(Gtk.Box):
     @GObject.Signal
     def dismiss(self):
@@ -59,6 +63,7 @@ class ExpandedPlayer(Gtk.Box):
         main_box.set_margin_bottom(16)
 
         self.covers = []
+        self._cover_offset = 0
         self.cover_img = self._make_cover()  # fallback center
 
         self.carousel = Adw.Carousel()
@@ -370,7 +375,8 @@ class ExpandedPlayer(Gtk.Box):
 
     def _center_carousel(self):
         self._ignore_page_change = True
-        self.carousel.scroll_to(self.cover_img, animate=False)
+        if self.cover_img and self.cover_img.get_parent() == self.carousel:
+            self.carousel.scroll_to(self.cover_img, animate=False)
         self._ignore_page_change = False
         return False
 
@@ -421,12 +427,21 @@ class ExpandedPlayer(Gtk.Box):
         return None
 
     def _sync_carousel_queue(self):
-        """Sync carousel sizing to match queue and lazy-load neighbors."""
+        """Keep a bounded carousel window around the current queue item."""
         queue_len = len(self.player.queue)
         idx = self.player.current_queue_index
 
         if queue_len == 0:
+            self._cover_offset = 0
+            while self.covers:
+                cover = self.covers.pop()
+                cover.video_id = None
+                cover.load_url(None)
+                if cover.get_parent() == self.carousel:
+                    self.carousel.remove(cover)
             return
+        if idx < 0 or idx >= queue_len:
+            idx = 0
 
         self._ignore_page_change = True
         # Re-armable token: only the most recent sync's timer is allowed to
@@ -437,91 +452,57 @@ class ExpandedPlayer(Gtk.Box):
         self._carousel_sync_token = getattr(self, "_carousel_sync_token", 0) + 1
         token = self._carousel_sync_token
 
-        # Trim excess covers immediately — removing widgets is cheap and we
-        # want the carousel page count tight before we scroll_to.
-        while len(self.covers) > queue_len:
+        window_len = min(queue_len, MAX_CAROUSEL_COVERS)
+        half_window = window_len // 2
+        max_offset = max(0, queue_len - window_len)
+        self._cover_offset = min(max(idx - half_window, 0), max_offset)
+
+        while len(self.covers) > window_len:
             cover = self.covers.pop()
+            cover.video_id = None
+            cover.load_url(None)
             if cover.get_parent() == self.carousel:
                 self.carousel.remove(cover)
 
-        # Adding new covers in bulk is the expensive part — _make_cover +
-        # carousel.append for an 850-track playlist measured at ~800ms of
-        # main-thread time, the exact "sometimes 800ms hang on click" the
-        # user reported. Front-load only what's needed for the current view
-        # (center ± a small buffer + the actively-playing index); idle-pump
-        # the rest in the background so the click handler returns fast.
-        needed_count = queue_len - len(self.covers)
-        if needed_count > 0:
-            BUFFER = 15
-            new_lo = max(len(self.covers), idx - BUFFER) if idx >= 0 else len(self.covers)
-            new_hi = min(queue_len, (idx + BUFFER + 1) if idx >= 0 else queue_len)
+        while len(self.covers) < window_len:
+            cover = self._make_cover()
+            self.covers.append(cover)
+            self.carousel.append(cover)
 
-            # Cover slots before/at/after the visible window are appended in
-            # carousel order, so we just iterate from current count up to
-            # queue_len. Synchronously create the priority window first, then
-            # idle-pump the rest.
-            priority_end = min(queue_len, max(new_hi, len(self.covers) + BUFFER))
-            while len(self.covers) < priority_end:
-                cover = self._make_cover()
-                self.covers.append(cover)
-                self.carousel.append(cover)
-
-            if len(self.covers) < queue_len:
-                # Pump the tail across idle ticks. Each chunk is small enough
-                # to fit comfortably in a single frame.
-                CHUNK = 40
-
-                def _pump_tail():
-                    if token != self._carousel_sync_token:
-                        return False  # superseded by a newer sync
-                    target_len = len(self.player.queue)
-                    end = min(len(self.covers) + CHUNK, target_len)
-                    while len(self.covers) < end:
-                        cover = self._make_cover()
-                        self.covers.append(cover)
-                        self.carousel.append(cover)
-                    if len(self.covers) < target_len:
-                        GLib.idle_add(_pump_tail, priority=GLib.PRIORITY_LOW)
-                    return False
-
-                GLib.idle_add(_pump_tail, priority=GLib.PRIORITY_LOW)
-
-        if 0 <= idx < len(self.covers):
-            self.cover_img = self.covers[idx]
+        page_idx = idx - self._cover_offset
+        if 0 <= page_idx < len(self.covers):
+            self.cover_img = self.covers[page_idx]
 
         self._last_lazy_idx = -1  # Force reload of the new window's covers
-        self._lazy_load_covers_around(idx)
+        self._lazy_load_covers_around(page_idx)
 
-        if 0 <= idx < len(self.covers):
-            self.carousel.scroll_to(self.covers[idx], animate=False)
+        if 0 <= page_idx < len(self.covers):
+            self.carousel.scroll_to(self.covers[page_idx], animate=False)
 
         GLib.timeout_add(200, self._allow_page_change, token)
 
-    def _lazy_load_covers_around(self, center_idx):
-        # Walking all N covers on every skip was O(queue length) per click —
-        # ~50-100ms of pure Python on a 850-track playlist, even though only
-        # ±5 covers actually need attention. Use a delta walk: update the
-        # 11 covers in the new window, clear the small set that just left it.
+    def _lazy_load_covers_around(self, center_page_idx):
         old_center = getattr(self, "_last_lazy_idx", -1)
-        if center_idx == old_center:
+        if center_page_idx == old_center:
             return
-        self._last_lazy_idx = center_idx
+        self._last_lazy_idx = center_page_idx
 
-        R = 5
+        R = CAROUSEL_PRELOAD_RADIUS
         total = len(self.covers)
         if total == 0:
             return
-        new_lo = max(0, center_idx - R)
-        new_hi = min(total - 1, center_idx + R)
+        new_lo = max(0, center_page_idx - R)
+        new_hi = min(total - 1, center_page_idx + R)
 
-        def _set_cover(i):
-            cover = self.covers[i]
-            thumb = self._get_track_thumb(i)
+        def _set_cover(page_idx):
+            cover = self.covers[page_idx]
+            queue_idx = self._cover_offset + page_idx
+            thumb = self._get_track_thumb(queue_idx)
             if thumb:
                 if not cover.get_visible():
                     cover.set_visible(True)
                 if cover.url != thumb:
-                    cover.video_id = self.player.queue[i].get("videoId")
+                    cover.video_id = self.player.queue[queue_idx].get("videoId")
                     cover.load_url(thumb)
             else:
                 if cover.get_visible():
@@ -530,8 +511,8 @@ class ExpandedPlayer(Gtk.Box):
                 if cover.url is not None:
                     cover.load_url(None)
 
-        def _clear_cover(i):
-            cover = self.covers[i]
+        def _clear_cover(page_idx):
+            cover = self.covers[page_idx]
             cover.video_id = None
             if cover.url is not None:
                 cover.load_url(None)
@@ -546,10 +527,10 @@ class ExpandedPlayer(Gtk.Box):
         if old_center >= 0:
             old_lo = max(0, old_center - R)
             old_hi = min(total - 1, old_center + R)
-            for i in range(old_lo, old_hi + 1):
-                if new_lo <= i <= new_hi:
+            for page_idx in range(old_lo, old_hi + 1):
+                if new_lo <= page_idx <= new_hi:
                     continue
-                _clear_cover(i)
+                _clear_cover(page_idx)
 
     def _allow_page_change(self, token=None):
         # Only the latest sync's timer may clear the flag.
@@ -822,27 +803,28 @@ class ExpandedPlayer(Gtk.Box):
             return
 
         pos = carousel.get_position()
-        idx = int(round(pos))
+        page_idx = int(round(pos))
 
         # Dynamically load array ranges during scroll
-        if 0 <= idx < len(self.covers):
-            self._lazy_load_covers_around(idx)
+        if 0 <= page_idx < len(self.covers):
+            self._lazy_load_covers_around(page_idx)
 
         # Only trigger when the carousel float position essentially reaches the target page
-        if abs(pos - idx) > 0.001:
+        if abs(pos - page_idx) > 0.001:
             return
 
-        active_page = carousel.get_nth_page(idx)
+        active_page = carousel.get_nth_page(page_idx)
 
         try:
-            new_idx = self.covers.index(active_page)
+            page_idx = self.covers.index(active_page)
         except ValueError:
             return
 
-        if new_idx != self.player.current_queue_index:
+        queue_idx = self._cover_offset + page_idx
+        if queue_idx != self.player.current_queue_index:
             self._ignore_page_change = True
 
-            if 0 <= new_idx < len(self.player.queue):
+            if 0 <= queue_idx < len(self.player.queue):
 
                 def _do_jump(jump_idx):
                     cur = self.player.current_queue_index
@@ -872,4 +854,4 @@ class ExpandedPlayer(Gtk.Box):
                     self.player.emit("state-changed", "queue-updated")
                     return False
 
-                GLib.idle_add(_do_jump, new_idx)
+                GLib.idle_add(_do_jump, queue_idx)
