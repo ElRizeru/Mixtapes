@@ -1,10 +1,12 @@
+<div align="center">
+<img height="150" src="assets/icons/hicolor/scalable/apps/com.pocoguy.Muse.svg" />
 
-<img align="left" height="150" src="assets/icons/hicolor/scalable/apps/com.pocoguy.Muse.svg" />
-
-# Mixtapes
+<h3 style="font-size: 30px"> Mixtapes </h3>
 
 A modern, Linux-first YouTube Music player built with GTK4 and Libadwaita.
 <br><small>formerly known as Muse</small>
+
+</div>
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![GitHub stars](https://img.shields.io/github/stars/m-obeid/Mixtapes)](https://github.com/m-obeid/Mixtapes/stargazers)
@@ -99,6 +101,7 @@ A portable (no-install) ZIP is also available from [GitHub Actions](https://gith
 
 > [!NOTE]
 > The Windows build is experimental. Known limitations:
+>
 > - SMTC (media controls) works but may show "Unknown app" without the installer
 > - Font rendering differs from Linux
 
@@ -122,16 +125,19 @@ A Nix flake is available. See [setup instructions](https://github.com/m-obeid/Mu
 <summary>Install dependencies for your distro</summary>
 
 **Arch Linux:**
+
 ```bash
 sudo pacman -S git python-pip nodejs gtk4 libadwaita webkitgtk-6.0 gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugins-ugly
 ```
 
 **Fedora:**
+
 ```bash
 sudo dnf install git python3 python3-pip nodejs gtk4-devel adwaita-gtk4-devel webkitgtk6.0-devel gstreamer1-plugins-base gstreamer1-plugins-good gstreamer1-plugins-bad gstreamer1-plugins-ugly
 ```
 
 **Debian/Ubuntu:**
+
 ```bash
 sudo apt install git python3 python3-pip nodejs libgtk-4-dev libadwaita-1-dev libwebkitgtk-6.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly
 ```
@@ -202,6 +208,7 @@ python src/main.py
 ```
 
 **SMTC bridge** (optional, for Windows media controls):
+
 ```bash
 # In a regular PowerShell/CMD (not MSYS2), with Rust installed:
 cd windows/bridge
@@ -210,6 +217,7 @@ cargo build --release
 ```
 
 **Login helper** (optional, for browser-based login):
+
 ```bash
 # In a regular PowerShell/CMD with Python 3.12:
 pip install pywebview pyinstaller
@@ -233,15 +241,15 @@ flatpak run com.pocoguy.Muse
 
 ### Prerequisites
 
-| Dependency | Purpose | Windows |
-|---|---|---|
-| Python 3.10+ | Core runtime | via MSYS2 |
-| Node.js | Required for yt-dlp-ejs (fixes playback issues) | via MSYS2 |
-| GTK4 + dev headers | UI toolkit | via MSYS2 |
-| Libadwaita + dev headers | GNOME UI components | via MSYS2 |
-| WebKitGTK 6.0 + dev headers | Embedded browser for auth | N/A (uses Login Helper) |
-| GStreamer plugins (base, good, bad, ugly) | Audio playback | via MSYS2 |
-| ffmpeg | Audio muxing for downloads | via MSYS2 |
+| Dependency                                | Purpose                                         | Windows                 |
+| ----------------------------------------- | ----------------------------------------------- | ----------------------- |
+| Python 3.10+                              | Core runtime                                    | via MSYS2               |
+| Node.js                                   | Required for yt-dlp-ejs (fixes playback issues) | via MSYS2               |
+| GTK4 + dev headers                        | UI toolkit                                      | via MSYS2               |
+| Libadwaita + dev headers                  | GNOME UI components                             | via MSYS2               |
+| WebKitGTK 6.0 + dev headers               | Embedded browser for auth                       | N/A (uses Login Helper) |
+| GStreamer plugins (base, good, bad, ugly) | Audio playback                                  | via MSYS2               |
+| ffmpeg                                    | Audio muxing for downloads                      | via MSYS2               |
 
 ## Authentication
 
@@ -275,33 +283,33 @@ Without a `browser.json` file, the app falls back to the unauthenticated API, wh
 
 ✅️ = implemented · ☑️ = partially implemented · 🔜 = planned · ❎️ = unlikely
 
-| Status | Feature | Details |
-|:---:|---|---|
-| ✅️ | **Authentication** | Connect to YouTube Music (Browser cookies) |
-| ✅️ | **Library** | ✅️ Playlists<br>✅️ Liked songs<br>✅️ Artists<br>✅️ Albums<br>✅️ Uploads |
-| ✅️ | **Search** | Search for songs, albums, and artists |
-| ✅️ | **Exploration** | ✅️ New Releases<br>✅️ Moods & Moments<br>✅️ Genres<br>✅️ Trending<br>✅️ Charts<br>✅️ Home Page |
-| ✅️ | **Artist Page** | ✅️ Basic info<br>✅️ Related artists<br>✅️ Top tracks<br>✅️ Albums<br>✅️ Singles/EPs<br>✅️ Videos<br>✅️ Play<br>✅️ Shuffle<br>✅️ Subscribe/Unsubscribe |
-| ✅️ | **Playlist Page** | ✅️ Info<br>✅️ Tracks<br>✅️ Play<br>✅️ Shuffle<br>✅️ Order<br>✅️ Multi-Selection Editing<br>✅️ Cover Change<br>✅️ Change Visibility<br>✅️ Change Description<br>✅️ Change Name |
-| ✅️ | **Album Page** | ✅️ Basic info<br>✅️ Tracks<br>✅️ Play<br>✅️ Shuffle |
-| ✅️ | **Player** | ✅️ Play/Pause<br>✅️ Seeking<br>✅️ Volume<br>✅️ Queue (Previous/Next, Reorder, Shuffle, Repeat modes) |
-| ✅️ | **History** | ✅️ View history<br> ✅️ Share history with Google account<br> ✅️ Delete songs from history |
-| ✅️ | **Caching** | Cache data to reduce latency |
-| ☑️ | **Responsive Design** | Mobile-friendly layout with adaptive UI |
-| ✅️ | **MPRIS Support** | Control playback from system media controls |
-| ✅️ | **Download Support** | Download tracks for offline playback, even as local files |
-| ✅️ | **Radio / Mixes** | Start a radio station from a song, album, playlist, or artist |
-| ✅️ | **Dedicated Data Directory** | Cookies, cache, etc. in a dedicated directory |
-| ✅️ | **Background Playback** | Music keeps playing when the window is closed |
-| ✅️ | **AUR** | Available as `mixtapes-git` |
-| ☑️ | **Flatpak** | ✅️ Flatpak build<br>🔜 Flathub release<br>✅️ App icon |
-| ☑️ | **Settings** | Configure app preferences (theme, audio quality, etc.). |
-| ✅️ | **Cover Art Tint** | Tint Libadwaita to match cover art, kinda like Material You |
-| ✅️ | **Discord RPC** | Show your current track on Discord<br>✅️ Linux<br>✅️ Windows |
-| ✅️ | **Lyrics** | Synchronized lyrics using a bunch of providers (Apple Music, BetterLyrics, BiniLyrics, NetEase, LRCLIB, native YT Music) |
-| ✅️ | **Windows** | ✅️ GTK4/Libadwaita via MSYS2<br>✅️ GStreamer playback<br>✅️ SMTC media controls<br>✅️ System tray<br>✅️ Installer<br>✅️ Login helper (Edge WebView2) |
-| 🔜 | **macOS** | Can build it for macOS, just need to test, there's a PR for auto-builds. |
-| 🔜 | **GNOME Circle** | Still considering it, might not happen |
+| Status | Feature                      | Details                                                                                                                                                                       |
+| :----: | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+|   ✅️   | **Authentication**           | Connect to YouTube Music (Browser cookies)                                                                                                                                    |
+|   ✅️   | **Library**                  | ✅️ Playlists<br>✅️ Liked songs<br>✅️ Artists<br>✅️ Albums<br>✅️ Uploads                                                                                                       |
+|   ✅️   | **Search**                   | Search for songs, albums, and artists                                                                                                                                         |
+|   ✅️   | **Exploration**              | ✅️ New Releases<br>✅️ Moods & Moments<br>✅️ Genres<br>✅️ Trending<br>✅️ Charts<br>✅️ Home Page                                                                                |
+|   ✅️   | **Artist Page**              | ✅️ Basic info<br>✅️ Related artists<br>✅️ Top tracks<br>✅️ Albums<br>✅️ Singles/EPs<br>✅️ Videos<br>✅️ Play<br>✅️ Shuffle<br>✅️ Subscribe/Unsubscribe                         |
+|   ✅️   | **Playlist Page**            | ✅️ Info<br>✅️ Tracks<br>✅️ Play<br>✅️ Shuffle<br>✅️ Order<br>✅️ Multi-Selection Editing<br>✅️ Cover Change<br>✅️ Change Visibility<br>✅️ Change Description<br>✅️ Change Name |
+|   ✅️   | **Album Page**               | ✅️ Basic info<br>✅️ Tracks<br>✅️ Play<br>✅️ Shuffle                                                                                                                           |
+|   ✅️   | **Player**                   | ✅️ Play/Pause<br>✅️ Seeking<br>✅️ Volume<br>✅️ Queue (Previous/Next, Reorder, Shuffle, Repeat modes)                                                                          |
+|   ✅️   | **History**                  | ✅️ View history<br> ✅️ Share history with Google account<br> ✅️ Delete songs from history                                                                                     |
+|   ✅️   | **Caching**                  | Cache data to reduce latency                                                                                                                                                  |
+|   ☑️   | **Responsive Design**        | Mobile-friendly layout with adaptive UI                                                                                                                                       |
+|   ✅️   | **MPRIS Support**            | Control playback from system media controls                                                                                                                                   |
+|   ✅️   | **Download Support**         | Download tracks for offline playback, even as local files                                                                                                                     |
+|   ✅️   | **Radio / Mixes**            | Start a radio station from a song, album, playlist, or artist                                                                                                                 |
+|   ✅️   | **Dedicated Data Directory** | Cookies, cache, etc. in a dedicated directory                                                                                                                                 |
+|   ✅️   | **Background Playback**      | Music keeps playing when the window is closed                                                                                                                                 |
+|   ✅️   | **AUR**                      | Available as `mixtapes-git`                                                                                                                                                   |
+|   ☑️   | **Flatpak**                  | ✅️ Flatpak build<br>🔜 Flathub release<br>✅️ App icon                                                                                                                         |
+|   ☑️   | **Settings**                 | Configure app preferences (theme, audio quality, etc.).                                                                                                                       |
+|   ✅️   | **Cover Art Tint**           | Tint Libadwaita to match cover art, kinda like Material You                                                                                                                   |
+|   ✅️   | **Discord RPC**              | Show your current track on Discord<br>✅️ Linux<br>✅️ Windows                                                                                                                  |
+|   ✅️   | **Lyrics**                   | Synchronized lyrics using a bunch of providers (Apple Music, BetterLyrics, BiniLyrics, NetEase, LRCLIB, native YT Music)                                                      |
+|   ✅️   | **Windows**                  | ✅️ GTK4/Libadwaita via MSYS2<br>✅️ GStreamer playback<br>✅️ SMTC media controls<br>✅️ System tray<br>✅️ Installer<br>✅️ Login helper (Edge WebView2)                          |
+|   🔜   | **macOS**                    | Can build it for macOS, just need to test, there's a PR for auto-builds.                                                                                                      |
+|   🔜   | **GNOME Circle**             | Still considering it, might not happen                                                                                                                                        |
 
 Have an idea or found a bug? [Open an issue!](https://github.com/m-obeid/Mixtapes/issues)
 
